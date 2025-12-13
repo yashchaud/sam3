@@ -1617,8 +1617,8 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                             # Use SAM3 Tracker for point-based prompts (Transformers API)
                             # Convert points to the required format: [batch][objects][points_per_object][coordinates]
                             points = [[x, y] for x, y in zip(session_data["points_x"], session_data["points_y"])]
-                            input_points = [[[points]]]  # 4D: [1 image][1 object][points][x,y]
-                            input_labels = [[[session_data["labels"]]]]  # 3D: [1 image][1 object][labels]
+                            input_points = [[points]]  # 4D: [1 image][1 object][list of [x,y] points]
+                            input_labels = [[session_data["labels"]]]  # 3D: [1 image][1 object][list of labels]
 
                             logger.info(f"Processing {len(points)} points with tracker model")
 
