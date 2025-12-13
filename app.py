@@ -1646,6 +1646,10 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                             # Convert masks to numpy
                             if hasattr(masks, 'numpy'):
                                 masks = masks.numpy()
+                            elif isinstance(masks, list):
+                                masks = np.array(masks)
+
+                            logger.info(f"Masks shape after conversion: {masks.shape}, dtype: {masks.dtype}")
 
                             # Take the first (best) mask
                             # masks shape: [num_objects, num_predictions_per_object, H, W]
@@ -1659,7 +1663,19 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                                 logger.error(f"Unexpected mask shape: {masks.shape}")
                                 raise ValueError(f"Unexpected mask shape: {masks.shape}")
 
-                            score = float(scores[0, 0]) if scores is not None and len(scores) > 0 else 0.0
+                            # Ensure mask is numpy array
+                            if hasattr(mask, 'numpy'):
+                                mask = mask.numpy()
+                            elif not isinstance(mask, np.ndarray):
+                                mask = np.array(mask)
+
+                            logger.info(f"Final mask shape: {mask.shape}, dtype: {mask.dtype}, type: {type(mask)}")
+
+                            # Extract score properly to avoid deprecation warning
+                            if scores is not None and scores.size > 0:
+                                score = float(scores.flat[0])  # Use flat indexing to get scalar
+                            else:
+                                score = 0.0
 
                             # Convert mask to base64 PNG
                             mask_base64 = masks_to_base64([mask])[0]
