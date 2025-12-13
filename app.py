@@ -1678,7 +1678,8 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                                 score = 0.0
 
                             # Convert mask to base64 PNG
-                            mask_base64 = masks_to_base64([mask])[0]
+                            # masks_to_base64 expects numpy array, not list
+                            mask_base64 = masks_to_base64(np.array([mask]))[0]
 
                             await websocket.send_json({
                                 "type": "segmentation_result",
