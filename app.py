@@ -121,10 +121,15 @@ async def load_model():
             import sys
             import torch
 
-            # Temporarily mock decord to avoid import errors from training modules
-            sys.modules['decord'] = type(sys)('decord')
-            sys.modules['decord'].cpu = lambda: None
-            sys.modules['decord'].VideoReader = lambda: None
+            # Mock training-only dependencies to avoid import errors
+            # These are only used in training code, not for inference
+            class MockModule:
+                def __getattr__(self, name):
+                    return lambda *args, **kwargs: None
+
+            sys.modules['decord'] = MockModule()
+            sys.modules['pycocotools'] = MockModule()
+            sys.modules['pycocotools.mask'] = MockModule()
 
             from sam3.model_builder import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
