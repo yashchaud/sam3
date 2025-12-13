@@ -98,16 +98,14 @@ else
     echo
 
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # Check if huggingface-cli is installed
-        if ! command -v huggingface-cli &> /dev/null; then
-            echo "Installing huggingface_hub..."
-            pip install huggingface_hub
-        fi
+        # Install huggingface_hub
+        echo "Installing huggingface_hub..."
+        pip install huggingface_hub
 
         # Login to Hugging Face
         echo ""
         echo "Please login to Hugging Face:"
-        huggingface-cli login
+        python -m huggingface_hub.commands.huggingface_cli login
 
         # Clone and install SAM3
         if [ ! -d "sam3_repo" ]; then

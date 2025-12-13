@@ -90,17 +90,14 @@ if errorlevel 1 (
 
     set /p CONTINUE="Have you completed these steps? (y/n): "
     if /i "%CONTINUE%"=="y" (
-        REM Check if huggingface-cli is installed
-        where huggingface-cli >nul 2>&1
-        if errorlevel 1 (
-            echo Installing huggingface_hub...
-            pip install huggingface_hub
-        )
+        REM Install huggingface_hub
+        echo Installing huggingface_hub...
+        pip install huggingface_hub
 
         REM Login to Hugging Face
         echo.
         echo Please login to Hugging Face:
-        huggingface-cli login
+        python -m huggingface_hub.commands.huggingface_cli login
 
         REM Clone and install SAM3
         if not exist "sam3_repo" (
