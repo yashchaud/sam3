@@ -1602,6 +1602,12 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                             # Convert points_x and points_y to points list
                             points = [[x, y] for x, y in zip(session_data["points_x"], session_data["points_y"])]
 
+                            # Debug: check function signature
+                            import inspect
+                            sig = inspect.signature(processor.add_geometric_prompt)
+                            logger.info(f"add_geometric_prompt signature: {sig}")
+                            logger.info(f"add_geometric_prompt parameters: {list(sig.parameters.keys())}")
+
                             output = processor.add_geometric_prompt(
                                 state=session_data["inference_state"],
                                 points=points,
