@@ -28,11 +28,20 @@ REM Check if SAM3 is installed
 echo Checking SAM3 installation...
 python -c "import sam3" >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] SAM3 is not installed
-    echo Please run setup.bat to complete the installation
-    exit /b 1
+    echo [WARNING] SAM3 import issue detected
+    echo Attempting to fix numpy compatibility...
+    pip install "numpy>=1.26.0,<2.0" --force-reinstall --no-deps >nul 2>&1
+
+    REM Check again
+    python -c "import sam3" >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] SAM3 is not installed properly
+        echo Error details:
+        python -c "import sam3"
+        exit /b 1
+    )
 )
-echo [OK] SAM3 is installed
+echo [OK] SAM3 is ready
 echo.
 
 REM Start the server

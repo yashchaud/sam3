@@ -3,7 +3,9 @@
     "allow": [
       "Bash(cat:*)",
       "Bash(chmod:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(source venv/bin/activate)",
+      "Bash(python:*)"
     ]
   }
 }

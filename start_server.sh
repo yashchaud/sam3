@@ -31,12 +31,23 @@ echo -e "${GREEN}✓ Virtual environment activated${NC}"
 # Check if SAM3 is installed
 echo ""
 echo "Checking SAM3 installation..."
-if ! python3 -c "import sam3" 2>/dev/null; then
-    echo -e "${RED}Error: SAM3 is not installed${NC}"
-    echo "Please run setup.sh to complete the installation"
-    exit 1
+SAM3_CHECK=$(python3 -c "import sam3; print('ok')" 2>&1)
+if [[ $SAM3_CHECK != "ok" ]]; then
+    echo -e "${YELLOW}Warning: SAM3 import issue detected${NC}"
+    echo "Attempting to fix numpy compatibility..."
+
+    # Fix numpy version conflict
+    pip install --upgrade "numpy>=1.26.0,<2.0" --force-reinstall
+
+    # Check again
+    if ! python3 -c "import sam3" 2>/dev/null; then
+        echo -e "${RED}Error: SAM3 is not installed properly${NC}"
+        echo "Error details:"
+        python3 -c "import sam3"
+        exit 1
+    fi
 fi
-echo -e "${GREEN}✓ SAM3 is installed${NC}"
+echo -e "${GREEN}✓ SAM3 is ready${NC}"
 
 # Start the server
 echo ""

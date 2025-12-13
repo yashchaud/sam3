@@ -120,7 +120,11 @@ if errorlevel 1 (
         cd sam3_repo
         pip install -e .
         cd ..
-        echo [OK] SAM3 installed
+
+        echo.
+        echo Fixing numpy compatibility...
+        pip install "numpy>=1.26.0,<2.0" --force-reinstall --no-deps
+        echo [OK] SAM3 installed and configured
     ) else (
         echo [WARNING] Skipping SAM3 installation
         echo You can install it later by running:

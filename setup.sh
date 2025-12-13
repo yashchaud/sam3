@@ -140,7 +140,12 @@ PYEOF
         cd sam3_repo
         pip install -e .
         cd ..
-        echo -e "${GREEN}✓ SAM3 installed${NC}"
+
+        # Fix numpy version conflict between SAM3 and opencv-python
+        echo ""
+        echo "Fixing numpy compatibility..."
+        pip install "numpy>=1.26.0,<2.0" --force-reinstall --no-deps
+        echo -e "${GREEN}✓ SAM3 installed and configured${NC}"
     else
         echo -e "${YELLOW}⚠ Skipping SAM3 installation${NC}"
         echo "You can install it later by running:"
