@@ -1602,6 +1602,10 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                             # Convert points_x and points_y to points list
                             points = [[x, y] for x, y in zip(session_data["points_x"], session_data["points_y"])]
 
+                            logger.info(f"Attempting segmentation with {len(points)} points")
+                            logger.info(f"Processor type: {type(processor)}")
+                            logger.info(f"Processor methods: {[m for m in dir(processor) if not m.startswith('_')]}")
+
                             output = processor.set_geometric_prompt(
                                 state=session_data["inference_state"],
                                 points=points,
@@ -1634,6 +1638,7 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
 
                         except Exception as e:
                             logger.error(f"Error in segmentation: {e}")
+                            logger.error(traceback.format_exc())
                             await websocket.send_json({
                                 "type": "error",
                                 "message": f"Segmentation failed: {str(e)}"
