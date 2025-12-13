@@ -615,7 +615,7 @@ async def segment_with_box(
         inference_state = processor.set_image(pil_image)
 
         # Add box prompt
-        output = processor.set_geometric_prompt(
+        output = processor.add_geometric_prompt(
             state=inference_state,
             boxes=[[x1, y1, x2, y2]]
         )
@@ -699,7 +699,7 @@ async def segment_with_box_base64(request: BoxSegmentRequest):
         inference_state = processor.set_image(pil_image)
 
         # Add box prompt
-        output = processor.set_geometric_prompt(
+        output = processor.add_geometric_prompt(
             state=inference_state,
             boxes=[[request.x1, request.y1, request.x2, request.y2]]
         )
@@ -818,7 +818,7 @@ async def segment_with_points(
         points = [[x, y] for x, y in zip(x_coords, y_coords)]
 
         # Add point prompts
-        output = processor.set_geometric_prompt(
+        output = processor.add_geometric_prompt(
             state=inference_state,
             points=points,
             labels=point_labels
@@ -913,7 +913,7 @@ async def segment_with_points_base64(request: PointSegmentRequest):
         points = [[x, y] for x, y in zip(request.points_x, request.points_y)]
 
         # Add point prompts
-        output = processor.set_geometric_prompt(
+        output = processor.add_geometric_prompt(
             state=inference_state,
             points=points,
             labels=request.labels
@@ -1239,7 +1239,7 @@ async def segment_with_box_url(request: BoxSegmentURLRequest):
         inference_state = processor.set_image(pil_image)
 
         # Add box prompt
-        output = processor.set_geometric_prompt(
+        output = processor.add_geometric_prompt(
             state=inference_state,
             boxes=[[request.x1, request.y1, request.x2, request.y2]]
         )
@@ -1340,7 +1340,7 @@ async def segment_with_points_url(request: PointSegmentURLRequest):
         points = [[x, y] for x, y in zip(request.points_x, request.points_y)]
 
         # Add point prompts
-        output = processor.set_geometric_prompt(
+        output = processor.add_geometric_prompt(
             state=inference_state,
             points=points,
             labels=request.labels
@@ -1602,11 +1602,7 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                             # Convert points_x and points_y to points list
                             points = [[x, y] for x, y in zip(session_data["points_x"], session_data["points_y"])]
 
-                            logger.info(f"Attempting segmentation with {len(points)} points")
-                            logger.info(f"Processor type: {type(processor)}")
-                            logger.info(f"Processor methods: {[m for m in dir(processor) if not m.startswith('_')]}")
-
-                            output = processor.set_geometric_prompt(
+                            output = processor.add_geometric_prompt(
                                 state=session_data["inference_state"],
                                 points=points,
                                 labels=session_data["labels"]
