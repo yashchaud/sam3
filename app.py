@@ -49,6 +49,10 @@ processor = None
 device = None
 model_loaded = False
 
+# Tracker model for point-based prompts (Transformers API)
+tracker_model = None
+tracker_processor = None
+
 # Real-time session management
 realtime_sessions = {}  # {session_id: {"inference_state": state, "image": pil_image, "last_activity": datetime}}
 
@@ -159,16 +163,20 @@ async def load_model():
             logger.info("Mocks installed successfully")
             logger.info("Importing SAM3 components...")
 
+            # Import native SAM3 for text/box prompts
             from sam3.model_builder import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
+
+            # Import Transformers SAM3Tracker for point prompts
+            from transformers import Sam3TrackerProcessor, Sam3TrackerModel
 
             logger.info("SAM3 modules imported successfully")
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info(f"Using device: {device}")
 
-            # Build model
-            logger.info("Building SAM3 model...")
+            # Build native SAM3 model for text/box prompts
+            logger.info("Building native SAM3 model...")
             model = build_sam3_image_model()
             logger.info("Model built, moving to device...")
 
@@ -177,9 +185,16 @@ async def load_model():
 
             logger.info("Creating SAM3 processor...")
             processor = Sam3Processor(model)
+
+            # Load Transformers SAM3Tracker for point-based prompts
+            logger.info("Loading SAM3 Tracker for point prompts...")
+            global tracker_model, tracker_processor
+            tracker_model = Sam3TrackerModel.from_pretrained("facebook/sam3").to(device)
+            tracker_processor = Sam3TrackerProcessor.from_pretrained("facebook/sam3")
+
             model_loaded = True
 
-            logger.info("SAM3 model loaded successfully!")
+            logger.info("SAM3 models loaded successfully!")
 
         except ImportError as e:
             logger.error(f"Failed to import SAM3: {e}")
@@ -1597,61 +1612,64 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                     })
 
                     # Automatically trigger segmentation
-                    if session_data["inference_state"] is not None and len(session_data["points_x"]) > 0:
+                    if session_data["image"] is not None and len(session_data["points_x"]) > 0:
                         try:
-                            # Convert points_x and points_y to points list
+                            # Use SAM3 Tracker for point-based prompts (Transformers API)
+                            # Convert points to the required format: [batch][objects][points_per_object][coordinates]
                             points = [[x, y] for x, y in zip(session_data["points_x"], session_data["points_y"])]
+                            input_points = [[[points]]]  # 4D: [1 image][1 object][points][x,y]
+                            input_labels = [[[session_data["labels"]]]]  # 3D: [1 image][1 object][labels]
 
-                            # Points need to be handled differently in SAM3
-                            # add_geometric_prompt only works for boxes, not points
-                            # Convert points to a bounding box as a workaround
-                            # Find min/max coordinates to create a box around the points
-                            points_array = np.array(points)
-                            x_min, y_min = points_array.min(axis=0)
-                            x_max, y_max = points_array.max(axis=0)
+                            logger.info(f"Processing {len(points)} points with tracker model")
 
-                            # Add some padding (10% of box size)
-                            width = x_max - x_min
-                            height = y_max - y_min
-                            padding = max(width, height) * 0.1
+                            # Process with SAM3 Tracker
+                            import torch
+                            inputs = tracker_processor(
+                                images=session_data["image"],
+                                input_points=input_points,
+                                input_labels=input_labels,
+                                return_tensors="pt"
+                            ).to(tracker_model.device)
 
-                            x_min = max(0, int(x_min - padding))
-                            y_min = max(0, int(y_min - padding))
-                            x_max = min(session_data["image"].width, int(x_max + padding))
-                            y_max = min(session_data["image"].height, int(y_max + padding))
+                            with torch.no_grad():
+                                outputs = tracker_model(**inputs, multimask_output=False)
 
-                            box = [x_min, y_min, x_max, y_max]
-                            logger.info(f"Converting {len(points)} points to box: {box}")
+                            # Post-process masks to original image size
+                            masks = tracker_processor.post_process_masks(
+                                outputs.pred_masks.cpu(),
+                                inputs["original_sizes"]
+                            )[0]  # Get masks for first (only) image
 
-                            output = processor.add_geometric_prompt(
-                                state=session_data["inference_state"],
-                                box=box,
-                                label=True  # True for foreground
-                            )
+                            # Extract scores
+                            scores = outputs.iou_scores.cpu().numpy() if hasattr(outputs, 'iou_scores') else None
 
-                            # Extract mask and score
-                            masks = output.get("masks")
-                            scores = output.get("scores")
+                            # Convert masks to numpy
+                            if hasattr(masks, 'numpy'):
+                                masks = masks.numpy()
 
-                            if masks is not None and len(masks) > 0:
-                                if hasattr(masks, 'cpu'):
-                                    masks = masks.cpu().numpy()
-                                if hasattr(scores, 'cpu'):
-                                    scores = scores.cpu().numpy()
+                            # Take the first (best) mask
+                            # masks shape: [num_objects, num_predictions_per_object, H, W]
+                            if len(masks.shape) == 4:
+                                mask = masks[0, 0]  # First object, first prediction
+                            elif len(masks.shape) == 3:
+                                mask = masks[0]  # First mask
+                            elif len(masks.shape) == 2:
+                                mask = masks
+                            else:
+                                logger.error(f"Unexpected mask shape: {masks.shape}")
+                                raise ValueError(f"Unexpected mask shape: {masks.shape}")
 
-                                # Take the first (best) mask
-                                mask = masks[0] if len(masks.shape) == 3 else masks
-                                score = float(scores[0]) if scores is not None and len(scores) > 0 else 0.0
+                            score = float(scores[0, 0]) if scores is not None and len(scores) > 0 else 0.0
 
-                                # Convert mask to base64 PNG
-                                mask_base64 = masks_to_base64([mask])[0]
+                            # Convert mask to base64 PNG
+                            mask_base64 = masks_to_base64([mask])[0]
 
-                                await websocket.send_json({
-                                    "type": "segmentation_result",
-                                    "mask": mask_base64,
-                                    "score": score,
-                                    "num_points": len(session_data["points_x"])
-                                })
+                            await websocket.send_json({
+                                "type": "segmentation_result",
+                                "mask": mask_base64,
+                                "score": score,
+                                "num_points": len(session_data["points_x"])
+                            })
 
                         except Exception as e:
                             logger.error(f"Error in segmentation: {e}")
