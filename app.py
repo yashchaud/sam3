@@ -323,8 +323,13 @@ def create_visualization(image: Image.Image, masks: np.ndarray, boxes=None) -> b
 
         for i, mask in enumerate(masks):
             color = np.random.random(3)
-            h, w = mask.shape
-            mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+            # Handle both 2D and 3D masks
+            if len(mask.shape) == 2:
+                h, w = mask.shape
+            else:
+                h, w = mask.shape[:2]
+            mask_2d = mask.reshape(h, w) if len(mask.shape) > 2 else mask
+            mask_image = mask_2d.reshape(h, w, 1) * color.reshape(1, 1, -1)
             ax.imshow(mask_image, alpha=0.5)
 
         # Draw boxes if provided
