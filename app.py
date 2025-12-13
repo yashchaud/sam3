@@ -116,32 +116,52 @@ async def load_model():
     try:
         logger.info("Loading SAM3 model...")
 
-        # Import SAM3 - use sys.path manipulation to avoid training module imports
+        # Import SAM3 - mock training dependencies first
         try:
             import sys
             import torch
 
+            logger.info("Setting up module mocks for training dependencies...")
+
             # Mock training-only dependencies to avoid import errors
             # These are only used in training code, not for inference
             class MockModule:
-                def __getattr__(self, name):
-                    return lambda *args, **kwargs: None
+                def __init__(self, name="MockModule"):
+                    self._name = name
 
-            sys.modules['decord'] = MockModule()
-            sys.modules['pycocotools'] = MockModule()
-            sys.modules['pycocotools.mask'] = MockModule()
+                def __getattr__(self, name):
+                    # Return a new mock for any attribute access
+                    return MockModule(f"{self._name}.{name}")
+
+                def __call__(self, *args, **kwargs):
+                    # Allow the mock to be called
+                    return MockModule(f"{self._name}()")
+
+            # Mock all training-only dependencies
+            sys.modules['decord'] = MockModule('decord')
+            sys.modules['pycocotools'] = MockModule('pycocotools')
+            sys.modules['pycocotools.mask'] = MockModule('pycocotools.mask')
+
+            logger.info("Mocks installed successfully")
+            logger.info("Importing SAM3 components...")
 
             from sam3.model_builder import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
+
+            logger.info("SAM3 modules imported successfully")
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info(f"Using device: {device}")
 
             # Build model
+            logger.info("Building SAM3 model...")
             model = build_sam3_image_model()
+            logger.info("Model built, moving to device...")
+
             if device == "cuda":
                 model = model.cuda()
 
+            logger.info("Creating SAM3 processor...")
             processor = Sam3Processor(model)
             model_loaded = True
 
@@ -150,6 +170,10 @@ async def load_model():
         except ImportError as e:
             logger.error(f"Failed to import SAM3: {e}")
             logger.error("Please install SAM3 following the instructions in README.md")
+            logger.error(traceback.format_exc())
+            model_loaded = False
+        except Exception as e:
+            logger.error(f"Error during SAM3 import/setup: {e}")
             logger.error(traceback.format_exc())
             model_loaded = False
 
