@@ -92,12 +92,13 @@ if errorlevel 1 (
     if /i "%CONTINUE%"=="y" (
         REM Install huggingface_hub
         echo Installing huggingface_hub...
-        pip install huggingface_hub
+        pip install -U huggingface_hub
 
         REM Login to Hugging Face
         echo.
         echo Please login to Hugging Face:
-        python -m huggingface_hub.commands.huggingface_cli login
+        echo Enter your Hugging Face token:
+        python -c "from huggingface_hub import login; login()"
 
         REM Clone and install SAM3
         if not exist "sam3_repo" (
