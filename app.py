@@ -1544,7 +1544,7 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                         image_base64 = image_base64.split(',', 1)[1]
 
                     image_bytes = base64.b64decode(image_base64)
-                    pil_image = validate_image(io.BytesIO(image_bytes))
+                    pil_image = validate_image(image_bytes)
 
                     # Set image in processor
                     inference_state = processor.set_image(pil_image)
