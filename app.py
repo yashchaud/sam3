@@ -1615,18 +1615,21 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                     if session_data["image"] is not None and len(session_data["points_x"]) > 0:
                         try:
                             # Use SAM3 Tracker for point-based prompts (Transformers API)
-                            # For real-time interaction, use only the LAST point clicked
-                            # This way each click segments the object at that point
-                            # (not accumulating points as refinement for one object)
-                            last_x = session_data["points_x"][-1]
-                            last_y = session_data["points_y"][-1]
-                            last_label = session_data["labels"][-1]
-
+                            # Each point represents a DIFFERENT object to segment simultaneously
                             # Format: [batch][objects][points_per_object][coordinates]
-                            input_points = [[[[last_x, last_y]]]]  # Single point
-                            input_labels = [[[last_label]]]  # Single label
 
-                            logger.info(f"Processing point ({last_x}, {last_y}) with label {last_label}")
+                            # Convert each point to a separate object
+                            objects_points = []
+                            objects_labels = []
+                            for px, py, pl in zip(session_data["points_x"], session_data["points_y"], session_data["labels"]):
+                                objects_points.append([[px, py]])  # One point per object
+                                objects_labels.append([pl])  # One label per object
+
+                            # Format: [1 image][N objects][1 point per object][x,y]
+                            input_points = [objects_points]
+                            input_labels = [objects_labels]
+
+                            logger.info(f"Processing {len(objects_points)} objects simultaneously")
 
                             # Process with SAM3 Tracker
                             import torch
@@ -1657,12 +1660,23 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
 
                             logger.info(f"Masks shape after conversion: {masks.shape}, dtype: {masks.dtype}")
 
-                            # Take the first (best) mask
+                            # Combine masks for ALL objects into one composite mask
                             # masks shape: [num_objects, num_predictions_per_object, H, W]
                             if len(masks.shape) == 4:
-                                mask = masks[0, 0]  # First object, first prediction
+                                # Multiple objects: combine all their masks
+                                num_objects = masks.shape[0]
+                                composite_mask = np.zeros(masks.shape[2:], dtype=bool)  # [H, W]
+
+                                for obj_idx in range(num_objects):
+                                    obj_mask = masks[obj_idx, 0]  # First prediction for each object
+                                    composite_mask = composite_mask | obj_mask  # OR operation to combine
+
+                                mask = composite_mask
+                                logger.info(f"Combined {num_objects} object masks")
+
                             elif len(masks.shape) == 3:
-                                mask = masks[0]  # First mask
+                                # Single object, multiple predictions
+                                mask = masks[0]
                             elif len(masks.shape) == 2:
                                 mask = masks
                             else:
@@ -1675,11 +1689,11 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                             elif not isinstance(mask, np.ndarray):
                                 mask = np.array(mask)
 
-                            logger.info(f"Final mask shape: {mask.shape}, dtype: {mask.dtype}, type: {type(mask)}")
+                            logger.info(f"Final composite mask shape: {mask.shape}, dtype: {mask.dtype}, type: {type(mask)}")
 
-                            # Extract score properly to avoid deprecation warning
+                            # Extract average score across all objects
                             if scores is not None and scores.size > 0:
-                                score = float(scores.flat[0])  # Use flat indexing to get scalar
+                                score = float(np.mean(scores))  # Average score across all objects
                             else:
                                 score = 0.0
 
