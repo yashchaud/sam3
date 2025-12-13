@@ -5,7 +5,8 @@
       "Bash(chmod:*)",
       "Bash(ls:*)",
       "Bash(source venv/bin/activate)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(find:*)"
     ]
   }
 }

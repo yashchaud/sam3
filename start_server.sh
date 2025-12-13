@@ -44,17 +44,25 @@ else
     echo -e "${YELLOW}Warning: SAM3 import issue detected${NC}"
     echo "Error message: $sam3_test_output"
     echo ""
-    echo "Attempting to fix numpy compatibility..."
 
-    # Fix numpy version conflict
-    pip install "numpy>=1.26.0,<2.0" --force-reinstall --no-deps --quiet
+    # Check for specific missing dependencies
+    if echo "$sam3_test_output" | grep -q "No module named 'einops'"; then
+        echo "Installing missing dependency: einops..."
+        pip install einops timm ftfy --quiet
+    elif echo "$sam3_test_output" | grep -q "numpy"; then
+        echo "Attempting to fix numpy compatibility..."
+        pip install "numpy>=1.26.0,<2.0" --force-reinstall --no-deps --quiet
+    else
+        echo "Installing missing SAM3 dependencies..."
+        pip install -r requirements.txt --quiet
+    fi
 
     # Check again
     sam3_test_output2=$(python3 -c "import sam3; print('SUCCESS')" 2>&1)
     sam3_test_exit2=$?
 
     if [ $sam3_test_exit2 -eq 0 ] && echo "$sam3_test_output2" | grep -q "SUCCESS"; then
-        echo -e "${GREEN}✓ SAM3 is ready (after numpy fix)${NC}"
+        echo -e "${GREEN}✓ SAM3 is ready (after fixing dependencies)${NC}"
     else
         echo -e "${RED}Error: SAM3 is not installed properly${NC}"
         echo ""
