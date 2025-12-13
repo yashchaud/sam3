@@ -1599,10 +1599,12 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                     # Automatically trigger segmentation
                     if session_data["inference_state"] is not None and len(session_data["points_x"]) > 0:
                         try:
+                            # Convert points_x and points_y to points list
+                            points = [[x, y] for x, y in zip(session_data["points_x"], session_data["points_y"])]
+
                             output = processor.set_geometric_prompt(
                                 state=session_data["inference_state"],
-                                points_x=session_data["points_x"],
-                                points_y=session_data["points_y"],
+                                points=points,
                                 labels=session_data["labels"]
                             )
 
