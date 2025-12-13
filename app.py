@@ -1,6 +1,7 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query, Body
-from fastapi.responses import Response, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query, Body, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response, JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from PIL import Image
 import io
 import base64
@@ -36,6 +37,12 @@ model = None
 processor = None
 device = None
 model_loaded = False
+
+# Real-time session management
+import uuid
+from datetime import datetime
+
+realtime_sessions = {}  # {session_id: {"inference_state": state, "image": pil_image, "last_activity": datetime}}
 
 # Pydantic models for JSON requests
 class TextSegmentRequest(BaseModel):
@@ -123,8 +130,7 @@ async def load_model():
 
             logger.info("Setting up module mocks for training dependencies...")
 
-            # Mock training-only dependencies to avoid import errors
-            # These are only used in training code, not for inference
+             # These are only used in training code, not for inference
             class MockModule:
                 def __init__(self, name="MockModule"):
                     self._name = name
@@ -388,6 +394,19 @@ async def health_check():
         "model_loaded": True,
         "device": device
     }
+
+@app.get("/app", response_class=HTMLResponse)
+async def serve_app():
+    """Serve the real-time segmentation web interface"""
+    import os
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    index_path = os.path.join(static_dir, "index.html")
+
+    if os.path.exists(index_path):
+        with open(index_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    else:
+        return "<h1>Error: Web interface not found</h1><p>Please ensure static/index.html exists.</p>"
 
 # File upload endpoints
 @app.post("/segment/text", response_model=SegmentationResponse)
@@ -1447,6 +1466,214 @@ async def segment_automatic_url(request: AutoSegmentURLRequest):
             status_code=500,
             detail=f"Segmentation failed: {str(e)}"
         )
+
+# WebSocket endpoint for real-time segmentation
+@app.websocket("/ws/realtime")
+async def websocket_realtime_segmentation(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time click/touch-based segmentation.
+
+    Protocol:
+    Client sends JSON messages:
+    - {"type": "init", "image": "base64_encoded_image"} - Initialize session with image
+    - {"type": "click", "x": 100, "y": 200, "label": 1} - Add click point (label: 1=foreground, 0=background)
+    - {"type": "segment"} - Trigger segmentation with current points
+    - {"type": "reset"} - Clear all points
+    - {"type": "close"} - End session
+
+    Server responds with JSON:
+    - {"type": "session_created", "session_id": "uuid"}
+    - {"type": "image_loaded", "width": 1920, "height": 1080}
+    - {"type": "point_added", "x": 100, "y": 200, "label": 1}
+    - {"type": "segmentation_result", "mask": "base64_png", "score": 0.95}
+    - {"type": "error", "message": "error description"}
+    """
+    await websocket.accept()
+    session_id = str(uuid.uuid4())
+    session_data = {
+        "inference_state": None,
+        "image": None,
+        "points_x": [],
+        "points_y": [],
+        "labels": [],
+        "last_activity": datetime.now()
+    }
+    realtime_sessions[session_id] = session_data
+
+    try:
+        # Send session ID to client
+        await websocket.send_json({
+            "type": "session_created",
+            "session_id": session_id
+        })
+
+        while True:
+            # Receive message from client
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+
+            # Update last activity
+            session_data["last_activity"] = datetime.now()
+
+            if msg_type == "init":
+                # Initialize session with image
+                try:
+                    if not model_loaded:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Model not loaded yet. Please wait."
+                        })
+                        continue
+
+                    image_base64 = data.get("image")
+                    if not image_base64:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "No image provided"
+                        })
+                        continue
+
+                    # Decode image
+                    if ',' in image_base64:
+                        image_base64 = image_base64.split(',', 1)[1]
+
+                    image_bytes = base64.b64decode(image_base64)
+                    pil_image = validate_image(io.BytesIO(image_bytes))
+
+                    # Set image in processor
+                    inference_state = processor.set_image(pil_image)
+
+                    # Store in session
+                    session_data["inference_state"] = inference_state
+                    session_data["image"] = pil_image
+                    session_data["points_x"] = []
+                    session_data["points_y"] = []
+                    session_data["labels"] = []
+
+                    await websocket.send_json({
+                        "type": "image_loaded",
+                        "width": pil_image.width,
+                        "height": pil_image.height
+                    })
+
+                except Exception as e:
+                    logger.error(f"Error loading image: {e}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Failed to load image: {str(e)}"
+                    })
+
+            elif msg_type == "click":
+                # Add click point
+                try:
+                    x = data.get("x")
+                    y = data.get("y")
+                    label = data.get("label", 1)  # Default to foreground
+
+                    if x is None or y is None:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Invalid click coordinates"
+                        })
+                        continue
+
+                    # Add point to session
+                    session_data["points_x"].append(int(x))
+                    session_data["points_y"].append(int(y))
+                    session_data["labels"].append(int(label))
+
+                    await websocket.send_json({
+                        "type": "point_added",
+                        "x": int(x),
+                        "y": int(y),
+                        "label": int(label),
+                        "total_points": len(session_data["points_x"])
+                    })
+
+                    # Automatically trigger segmentation
+                    if session_data["inference_state"] is not None and len(session_data["points_x"]) > 0:
+                        try:
+                            output = processor.set_geometric_prompt(
+                                state=session_data["inference_state"],
+                                points_x=session_data["points_x"],
+                                points_y=session_data["points_y"],
+                                labels=session_data["labels"]
+                            )
+
+                            # Extract mask and score
+                            masks = output.get("masks")
+                            scores = output.get("scores")
+
+                            if masks is not None and len(masks) > 0:
+                                if hasattr(masks, 'cpu'):
+                                    masks = masks.cpu().numpy()
+                                if hasattr(scores, 'cpu'):
+                                    scores = scores.cpu().numpy()
+
+                                # Take the first (best) mask
+                                mask = masks[0] if len(masks.shape) == 3 else masks
+                                score = float(scores[0]) if scores is not None and len(scores) > 0 else 0.0
+
+                                # Convert mask to base64 PNG
+                                mask_base64 = masks_to_base64([mask])[0]
+
+                                await websocket.send_json({
+                                    "type": "segmentation_result",
+                                    "mask": mask_base64,
+                                    "score": score,
+                                    "num_points": len(session_data["points_x"])
+                                })
+
+                        except Exception as e:
+                            logger.error(f"Error in segmentation: {e}")
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": f"Segmentation failed: {str(e)}"
+                            })
+
+                except Exception as e:
+                    logger.error(f"Error adding point: {e}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Failed to add point: {str(e)}"
+                    })
+
+            elif msg_type == "reset":
+                # Clear all points
+                session_data["points_x"] = []
+                session_data["points_y"] = []
+                session_data["labels"] = []
+
+                await websocket.send_json({
+                    "type": "points_cleared"
+                })
+
+            elif msg_type == "close":
+                # End session
+                break
+
+            else:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Unknown message type: {msg_type}"
+                })
+
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for session {session_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        # Clean up session
+        if session_id in realtime_sessions:
+            del realtime_sessions[session_id]
+        logger.info(f"Session {session_id} cleaned up")
+
+# Mount static files for the web interface
+import os
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 if __name__ == "__main__":
     import uvicorn

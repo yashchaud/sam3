@@ -19,11 +19,13 @@ chmod +x start_server.sh && ./start_server.sh    # Start server
 
 ## Features
 
+- **🎯 Real-time Click/Touch Segmentation** - NEW! Interactive web interface with live segmentation ([docs](REALTIME_SEGMENTATION.md))
 - **Text-based segmentation** - Open-vocabulary segmentation using natural language
 - **Bounding box segmentation** - Segment objects within specified boxes
 - **Point-based segmentation** - Segment with positive/negative point prompts
 - **Automatic segmentation** - Segment all objects without prompts
 - **Dual input modes** - File upload AND base64 JSON endpoints for web apps
+- **WebSocket API** - Real-time bidirectional communication for interactive apps
 - **Visualization support** - Get overlaid mask visualizations
 - **Comprehensive error handling** - Detailed error messages and validation
 - **CORS enabled** - Ready for web integration
@@ -118,6 +120,21 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed instructions.
    ```
 
 The API will be available at `http://localhost:8000`
+
+## Real-time Interactive Segmentation 🎯
+
+**NEW!** Try the interactive web interface for real-time click-based segmentation:
+
+**[http://localhost:8000/app](http://localhost:8000/app)**
+
+Features:
+- Click on objects to segment them instantly
+- Real-time mask updates with each click
+- Add multiple points to refine segmentation
+- Support for foreground (left-click) and background (right-click) points
+- Touch support for mobile devices
+
+See [REALTIME_SEGMENTATION.md](REALTIME_SEGMENTATION.md) for full documentation and WebSocket API details.
 
 ## API Documentation
 
