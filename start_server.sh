@@ -24,28 +24,48 @@ fi
 # Activate virtual environment
 echo "Activating virtual environment..."
 source venv/bin/activate
+if [ $? -ne 0 ]; then
+    echo -e "${RED}Error: Failed to activate virtual environment${NC}"
+    exit 1
+fi
 echo -e "${GREEN}✓ Virtual environment activated${NC}"
 
 # Check if SAM3 is installed
 echo ""
 echo "Checking SAM3 installation..."
-SAM3_CHECK=$(python3 -c "import sam3; print('ok')" 2>&1)
-if [[ $SAM3_CHECK != "ok" ]]; then
+
+# Try to import SAM3 and capture both output and exit code
+sam3_test_output=$(python3 -c "import sam3; print('SUCCESS')" 2>&1)
+sam3_test_exit=$?
+
+if [ $sam3_test_exit -eq 0 ] && echo "$sam3_test_output" | grep -q "SUCCESS"; then
+    echo -e "${GREEN}✓ SAM3 is ready${NC}"
+else
     echo -e "${YELLOW}Warning: SAM3 import issue detected${NC}"
+    echo "Error message: $sam3_test_output"
+    echo ""
     echo "Attempting to fix numpy compatibility..."
 
     # Fix numpy version conflict
-    pip install --upgrade "numpy>=1.26.0,<2.0" --force-reinstall
+    pip install "numpy>=1.26.0,<2.0" --force-reinstall --no-deps --quiet
 
     # Check again
-    if ! python3 -c "import sam3" 2>/dev/null; then
+    sam3_test_output2=$(python3 -c "import sam3; print('SUCCESS')" 2>&1)
+    sam3_test_exit2=$?
+
+    if [ $sam3_test_exit2 -eq 0 ] && echo "$sam3_test_output2" | grep -q "SUCCESS"; then
+        echo -e "${GREEN}✓ SAM3 is ready (after numpy fix)${NC}"
+    else
         echo -e "${RED}Error: SAM3 is not installed properly${NC}"
+        echo ""
         echo "Error details:"
-        python3 -c "import sam3"
+        echo "$sam3_test_output2"
+        echo ""
+        echo "Please run setup.sh to install SAM3:"
+        echo "  ./setup.sh"
         exit 1
     fi
 fi
-echo -e "${GREEN}✓ SAM3 is ready${NC}"
 
 # Start the server
 echo ""

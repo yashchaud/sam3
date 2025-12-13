@@ -3,7 +3,8 @@
 # SAM3 API - Quick Setup Script
 # This script sets up the SAM3 API server on your local machine
 
-set -e  # Exit on error
+# Exit on error, but we'll handle specific errors manually
+set -e
 
 echo "=================================="
 echo "SAM3 API - Quick Setup"
