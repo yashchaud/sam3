@@ -116,11 +116,18 @@ async def load_model():
     try:
         logger.info("Loading SAM3 model...")
 
-        # Import SAM3
+        # Import SAM3 - use sys.path manipulation to avoid training module imports
         try:
+            import sys
+            import torch
+
+            # Temporarily mock decord to avoid import errors from training modules
+            sys.modules['decord'] = type(sys)('decord')
+            sys.modules['decord'].cpu = lambda: None
+            sys.modules['decord'].VideoReader = lambda: None
+
             from sam3.model_builder import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
-            import torch
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info(f"Using device: {device}")
@@ -138,6 +145,7 @@ async def load_model():
         except ImportError as e:
             logger.error(f"Failed to import SAM3: {e}")
             logger.error("Please install SAM3 following the instructions in README.md")
+            logger.error(traceback.format_exc())
             model_loaded = False
 
     except Exception as e:
