@@ -3,8 +3,6 @@
 # SAM3 API - Server Starter Script
 # This script activates the virtual environment and starts the API server
 
-set -e  # Exit on error
-
 # Colors for output
 GREEN='\033[0;32m'
 RED='\033[0;31m'
