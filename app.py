@@ -1615,12 +1615,18 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                     if session_data["image"] is not None and len(session_data["points_x"]) > 0:
                         try:
                             # Use SAM3 Tracker for point-based prompts (Transformers API)
-                            # Convert points to the required format: [batch][objects][points_per_object][coordinates]
-                            points = [[x, y] for x, y in zip(session_data["points_x"], session_data["points_y"])]
-                            input_points = [[points]]  # 4D: [1 image][1 object][list of [x,y] points]
-                            input_labels = [[session_data["labels"]]]  # 3D: [1 image][1 object][list of labels]
+                            # For real-time interaction, use only the LAST point clicked
+                            # This way each click segments the object at that point
+                            # (not accumulating points as refinement for one object)
+                            last_x = session_data["points_x"][-1]
+                            last_y = session_data["points_y"][-1]
+                            last_label = session_data["labels"][-1]
 
-                            logger.info(f"Processing {len(points)} points with tracker model")
+                            # Format: [batch][objects][points_per_object][coordinates]
+                            input_points = [[[[last_x, last_y]]]]  # Single point
+                            input_labels = [[[last_label]]]  # Single label
+
+                            logger.info(f"Processing point ({last_x}, {last_y}) with label {last_label}")
 
                             # Process with SAM3 Tracker
                             import torch
