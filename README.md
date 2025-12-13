@@ -2,6 +2,21 @@
 
 A production-ready FastAPI service for SAM3 (Segment Anything Model 3) image segmentation with comprehensive error handling, validation, and all supported features.
 
+## Quick Start
+
+**Want to get started immediately?** See [QUICKSTART.md](QUICKSTART.md) for a 3-step guide:
+
+```bash
+git clone <your-repo>
+cd sam3
+chmod +x setup.sh && ./setup.sh    # Automated setup
+chmod +x start_server.sh && ./start_server.sh    # Start server
+```
+
+**Windows users**: Use `setup.bat` and `start_server.bat` instead.
+
+**Docker users**: See Docker installation section below.
+
 ## Features
 
 - **Text-based segmentation** - Open-vocabulary segmentation using natural language
@@ -24,7 +39,30 @@ A production-ready FastAPI service for SAM3 (Segment Anything Model 3) image seg
 
 ## Installation
 
-### Option 1: Local Installation
+### Option 1: Quick Setup (Recommended)
+
+**Linux/macOS:**
+```bash
+chmod +x setup.sh
+./setup.sh
+./start_server.sh
+```
+
+**Windows:**
+```batch
+setup.bat
+start_server.bat
+```
+
+The setup script automatically handles:
+- Python environment setup
+- Dependency installation
+- CUDA detection and PyTorch installation
+- SAM3 installation with Hugging Face authentication
+
+See [QUICKSTART.md](QUICKSTART.md) for detailed instructions.
+
+### Option 2: Manual Installation
 
 1. **Request SAM3 model access**
 
@@ -64,7 +102,7 @@ A production-ready FastAPI service for SAM3 (Segment Anything Model 3) image seg
    python app.py
    ```
 
-### Option 2: Docker Installation
+### Option 3: Docker Installation
 
 1. **Build and run with Docker Compose**
 

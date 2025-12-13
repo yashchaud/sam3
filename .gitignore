@@ -48,6 +48,9 @@ models/
 checkpoints/
 .cache/
 
+# SAM3 repository (cloned during setup)
+sam3_repo/
+
 # Output
 output/
 *.png
