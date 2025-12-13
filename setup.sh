@@ -99,14 +99,35 @@ else
 
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         # Install huggingface_hub
+        echo ""
         echo "Installing huggingface_hub..."
         pip install -U huggingface_hub
 
-        # Login to Hugging Face
+        # Login to Hugging Face using Python
         echo ""
-        echo "Please login to Hugging Face:"
-        echo "Enter your Hugging Face token:"
-        python -c "from huggingface_hub import login; login()"
+        echo "==================================="
+        echo "Hugging Face Login"
+        echo "==================================="
+        echo "You'll be prompted to enter your Hugging Face token."
+        echo "Get your token at: https://huggingface.co/settings/tokens"
+        echo ""
+
+        python3 << 'PYEOF'
+from huggingface_hub import login
+import sys
+
+try:
+    login()
+    print("\n✓ Successfully logged in to Hugging Face!")
+except Exception as e:
+    print(f"\n✗ Login failed: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}Failed to login to Hugging Face${NC}"
+            exit 1
+        fi
 
         # Clone and install SAM3
         if [ ! -d "sam3_repo" ]; then

@@ -90,15 +90,24 @@ if errorlevel 1 (
 
     set /p CONTINUE="Have you completed these steps? (y/n): "
     if /i "%CONTINUE%"=="y" (
-        REM Install huggingface_hub
+        echo.
         echo Installing huggingface_hub...
         pip install -U huggingface_hub
 
-        REM Login to Hugging Face
         echo.
-        echo Please login to Hugging Face:
-        echo Enter your Hugging Face token:
-        python -c "from huggingface_hub import login; login()"
+        echo ===================================
+        echo Hugging Face Login
+        echo ===================================
+        echo You'll be prompted to enter your Hugging Face token.
+        echo Get your token at: https://huggingface.co/settings/tokens
+        echo.
+
+        REM Use Python for login
+        python -c "from huggingface_hub import login; login(); print('\n[OK] Successfully logged in to Hugging Face!')"
+        if errorlevel 1 (
+            echo [ERROR] Failed to login to Hugging Face
+            exit /b 1
+        )
 
         REM Clone and install SAM3
         if not exist "sam3_repo" (
