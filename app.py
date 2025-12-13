@@ -323,13 +323,21 @@ def create_visualization(image: Image.Image, masks: np.ndarray, boxes=None) -> b
 
         for i, mask in enumerate(masks):
             color = np.random.random(3)
-            # Handle both 2D and 3D masks
+            # Ensure mask is 2D
+            if len(mask.shape) > 2:
+                # Flatten extra dimensions
+                mask = mask.squeeze()
+
+            # Get the actual height and width from the mask
             if len(mask.shape) == 2:
                 h, w = mask.shape
             else:
-                h, w = mask.shape[:2]
-            mask_2d = mask.reshape(h, w) if len(mask.shape) > 2 else mask
-            mask_image = mask_2d.reshape(h, w, 1) * color.reshape(1, 1, -1)
+                # If still not 2D, something is wrong - log and skip
+                logger.warning(f"Unexpected mask shape: {mask.shape}, skipping")
+                continue
+
+            # Create colored mask overlay
+            mask_image = mask[:, :, np.newaxis] * color.reshape(1, 1, -1)
             ax.imshow(mask_image, alpha=0.5)
 
         # Draw boxes if provided
