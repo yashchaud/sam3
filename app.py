@@ -1608,11 +1608,21 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                             logger.info(f"add_geometric_prompt signature: {sig}")
                             logger.info(f"add_geometric_prompt parameters: {list(sig.parameters.keys())}")
 
-                            output = processor.add_geometric_prompt(
-                                state=session_data["inference_state"],
-                                points=points,
-                                labels=session_data["labels"]
-                            )
+                            # Try different parameter names
+                            try:
+                                output = processor.add_geometric_prompt(
+                                    state=session_data["inference_state"],
+                                    points=points,
+                                    labels=session_data["labels"]
+                                )
+                            except TypeError as e:
+                                logger.info(f"First attempt failed: {e}")
+                                logger.info("Trying with point_coords and point_labels...")
+                                output = processor.add_geometric_prompt(
+                                    state=session_data["inference_state"],
+                                    point_coords=points,
+                                    point_labels=session_data["labels"]
+                                )
 
                             # Extract mask and score
                             masks = output.get("masks")
