@@ -1514,11 +1514,10 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
     session_data = {
         "inference_state": None,
         "image": None,
-        "points_x": [],
-        "points_y": [],
-        "labels": [],
+        "objects": [],  # List of objects, each with their own points
         "last_activity": datetime.now()
     }
+    # Each object: {"points": [[x,y], ...], "labels": [1,0,...], "mask": cached_mask}
     realtime_sessions[session_id] = session_data
 
     try:
@@ -1567,9 +1566,7 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                     # Store in session
                     session_data["inference_state"] = inference_state
                     session_data["image"] = pil_image
-                    session_data["points_x"] = []
-                    session_data["points_y"] = []
-                    session_data["labels"] = []
+                    session_data["objects"] = []  # Clear all objects
 
                     await websocket.send_json({
                         "type": "image_loaded",
@@ -1598,32 +1595,56 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                         })
                         continue
 
-                    # Add point to session
-                    session_data["points_x"].append(int(x))
-                    session_data["points_y"].append(int(y))
-                    session_data["labels"].append(int(label))
+                    # Smart object grouping: assign point to nearest object or create new one
+                    PROXIMITY_THRESHOLD = 100  # pixels - adjust as needed
+                    assigned_to_object = None
+
+                    # Find nearest object within threshold
+                    for obj_idx, obj in enumerate(session_data["objects"]):
+                        for px, py in obj["points"]:
+                            distance = np.sqrt((x - px)**2 + (y - py)**2)
+                            if distance < PROXIMITY_THRESHOLD:
+                                assigned_to_object = obj_idx
+                                break
+                        if assigned_to_object is not None:
+                            break
+
+                    if assigned_to_object is not None:
+                        # Add to existing object (refinement)
+                        session_data["objects"][assigned_to_object]["points"].append([int(x), int(y)])
+                        session_data["objects"][assigned_to_object]["labels"].append(int(label))
+                        logger.info(f"Adding refinement point to object {assigned_to_object}")
+                    else:
+                        # Create new object
+                        new_object = {
+                            "points": [[int(x), int(y)]],
+                            "labels": [int(label)],
+                            "mask": None
+                        }
+                        session_data["objects"].append(new_object)
+                        logger.info(f"Created new object {len(session_data['objects']) - 1}")
 
                     await websocket.send_json({
                         "type": "point_added",
                         "x": int(x),
                         "y": int(y),
                         "label": int(label),
-                        "total_points": len(session_data["points_x"])
+                        "object_id": assigned_to_object if assigned_to_object is not None else len(session_data["objects"]) - 1,
+                        "total_objects": len(session_data["objects"])
                     })
 
                     # Automatically trigger segmentation
-                    if session_data["image"] is not None and len(session_data["points_x"]) > 0:
+                    if session_data["image"] is not None and len(session_data["objects"]) > 0:
                         try:
                             # Use SAM3 Tracker for point-based prompts (Transformers API)
-                            # Each point represents a DIFFERENT object to segment simultaneously
+                            # Each object can have multiple refinement points
                             # Format: [batch][objects][points_per_object][coordinates]
 
-                            # Convert each point to a separate object
                             objects_points = []
                             objects_labels = []
-                            for px, py, pl in zip(session_data["points_x"], session_data["points_y"], session_data["labels"]):
-                                objects_points.append([[px, py]])  # One point per object
-                                objects_labels.append([pl])  # One label per object
+                            for obj in session_data["objects"]:
+                                objects_points.append(obj["points"])  # All points for this object
+                                objects_labels.append(obj["labels"])  # All labels for this object
 
                             # Format: [1 image][N objects][1 point per object][x,y]
                             input_points = [objects_points]
@@ -1705,7 +1726,8 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                                 "type": "segmentation_result",
                                 "mask": mask_base64,
                                 "score": score,
-                                "num_points": len(session_data["points_x"])
+                                "num_objects": len(session_data["objects"]),
+                                "total_points": sum(len(obj["points"]) for obj in session_data["objects"])
                             })
 
                         except Exception as e:
@@ -1724,10 +1746,8 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                     })
 
             elif msg_type == "reset":
-                # Clear all points
-                session_data["points_x"] = []
-                session_data["points_y"] = []
-                session_data["labels"] = []
+                # Clear all objects
+                session_data["objects"] = []
 
                 await websocket.send_json({
                     "type": "points_cleared"
