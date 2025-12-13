@@ -1602,27 +1602,32 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
                             # Convert points_x and points_y to points list
                             points = [[x, y] for x, y in zip(session_data["points_x"], session_data["points_y"])]
 
-                            # Debug: check function signature
-                            import inspect
-                            sig = inspect.signature(processor.add_geometric_prompt)
-                            logger.info(f"add_geometric_prompt signature: {sig}")
-                            logger.info(f"add_geometric_prompt parameters: {list(sig.parameters.keys())}")
+                            # Points need to be handled differently in SAM3
+                            # add_geometric_prompt only works for boxes, not points
+                            # Convert points to a bounding box as a workaround
+                            # Find min/max coordinates to create a box around the points
+                            points_array = np.array(points)
+                            x_min, y_min = points_array.min(axis=0)
+                            x_max, y_max = points_array.max(axis=0)
 
-                            # Try different parameter names
-                            try:
-                                output = processor.add_geometric_prompt(
-                                    state=session_data["inference_state"],
-                                    points=points,
-                                    labels=session_data["labels"]
-                                )
-                            except TypeError as e:
-                                logger.info(f"First attempt failed: {e}")
-                                logger.info("Trying with point_coords and point_labels...")
-                                output = processor.add_geometric_prompt(
-                                    state=session_data["inference_state"],
-                                    point_coords=points,
-                                    point_labels=session_data["labels"]
-                                )
+                            # Add some padding (10% of box size)
+                            width = x_max - x_min
+                            height = y_max - y_min
+                            padding = max(width, height) * 0.1
+
+                            x_min = max(0, int(x_min - padding))
+                            y_min = max(0, int(y_min - padding))
+                            x_max = min(session_data["image"].width, int(x_max + padding))
+                            y_max = min(session_data["image"].height, int(y_max + padding))
+
+                            box = [x_min, y_min, x_max, y_max]
+                            logger.info(f"Converting {len(points)} points to box: {box}")
+
+                            output = processor.add_geometric_prompt(
+                                state=session_data["inference_state"],
+                                box=box,
+                                label=True  # True for foreground
+                            )
 
                             # Extract mask and score
                             masks = output.get("masks")
