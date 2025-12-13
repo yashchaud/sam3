@@ -12,6 +12,9 @@ import traceback
 from pydantic import BaseModel, Field, HttpUrl
 import cv2
 import httpx
+import os
+import uuid
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +35,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount static files for the web interface
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+    logger.info(f"Static files mounted from {static_dir}")
+else:
+    logger.warning(f"Static directory not found: {static_dir}")
+
 # Global variables
 model = None
 processor = None
@@ -39,9 +50,6 @@ device = None
 model_loaded = False
 
 # Real-time session management
-import uuid
-from datetime import datetime
-
 realtime_sessions = {}  # {session_id: {"inference_state": state, "image": pil_image, "last_activity": datetime}}
 
 # Pydantic models for JSON requests
@@ -398,8 +406,6 @@ async def health_check():
 @app.get("/app", response_class=HTMLResponse)
 async def serve_app():
     """Serve the real-time segmentation web interface"""
-    import os
-    static_dir = os.path.join(os.path.dirname(__file__), "static")
     index_path = os.path.join(static_dir, "index.html")
 
     if os.path.exists(index_path):
@@ -1668,12 +1674,6 @@ async def websocket_realtime_segmentation(websocket: WebSocket):
         if session_id in realtime_sessions:
             del realtime_sessions[session_id]
         logger.info(f"Session {session_id} cleaned up")
-
-# Mount static files for the web interface
-import os
-static_dir = os.path.join(os.path.dirname(__file__), "static")
-if os.path.exists(static_dir):
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 if __name__ == "__main__":
     import uvicorn
