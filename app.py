@@ -52,29 +52,34 @@ PROXIMITY_THRESHOLD = 100
 async def load_model():
     global model, processor, device, tracker_model, tracker_processor
 
-    try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device: {device}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {device}")
 
+    from transformers import Sam3TrackerProcessor, Sam3TrackerModel
+
+    try:
+        logger.info("Loading SAM3 Tracker model (required for WebSocket)...")
+        tracker_model = Sam3TrackerModel.from_pretrained("facebook/sam3").to(device)
+        tracker_processor = Sam3TrackerProcessor.from_pretrained("facebook/sam3")
+        tracker_model.eval()
+        logger.info("SAM3 Tracker loaded successfully")
+    except Exception as e:
+        logger.error(f"Tracker model loading failed: {e}")
+        raise
+
+    try:
+        logger.info("Loading SAM3 native model (optional)...")
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
-        from transformers import Sam3TrackerProcessor, Sam3TrackerModel
 
-        logger.info("Building SAM3 native model...")
         model = build_sam3_image_model()
         if device == "cuda":
             model = model.cuda()
         processor = Sam3Processor(model)
-
-        logger.info("Loading SAM3 Tracker model...")
-        tracker_model = Sam3TrackerModel.from_pretrained("facebook/sam3").to(device)
-        tracker_processor = Sam3TrackerProcessor.from_pretrained("facebook/sam3")
-        tracker_model.eval()
-
-        logger.info("Models loaded successfully")
+        logger.info("SAM3 native model loaded successfully")
     except Exception as e:
-        logger.error(f"Model loading failed: {e}")
-        raise
+        logger.warning(f"Native model loading failed (non-critical): {e}")
+        logger.info("Continuing with Tracker model only (sufficient for WebSocket)")
 
 def decode_base64_image(image_str: str) -> bytes:
     if image_str.startswith('data:image'):
