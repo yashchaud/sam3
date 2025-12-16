@@ -11,6 +11,9 @@ import os
 import uuid
 from datetime import datetime
 import torch
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
