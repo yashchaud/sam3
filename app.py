@@ -60,8 +60,10 @@ async def load_model():
         from sam3.model.sam3_image_processor import Sam3Processor
         from transformers import Sam3TrackerProcessor, Sam3TrackerModel
 
-        logger.info("Loading SAM3 native model...")
-        model = build_sam3_image_model(model_name="large", device=device)
+        logger.info("Building SAM3 native model...")
+        model = build_sam3_image_model()
+        if device == "cuda":
+            model = model.cuda()
         processor = Sam3Processor(model)
 
         logger.info("Loading SAM3 Tracker model...")
