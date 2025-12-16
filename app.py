@@ -55,16 +55,32 @@ async def load_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if not hf_token:
+        logger.warning("No Hugging Face token found in environment (HF_TOKEN or HUGGING_FACE_HUB_TOKEN)")
+        logger.warning("You may need to set HF_TOKEN env variable if model download fails")
+
     from transformers import Sam3TrackerProcessor, Sam3TrackerModel
 
     try:
         logger.info("Loading SAM3 Tracker model (required for WebSocket)...")
-        tracker_model = Sam3TrackerModel.from_pretrained("facebook/sam3").to(device)
-        tracker_processor = Sam3TrackerProcessor.from_pretrained("facebook/sam3")
+        tracker_model = Sam3TrackerModel.from_pretrained(
+            "facebook/sam3",
+            token=hf_token,
+            use_auth_token=hf_token
+        ).to(device)
+        tracker_processor = Sam3TrackerProcessor.from_pretrained(
+            "facebook/sam3",
+            token=hf_token,
+            use_auth_token=hf_token
+        )
         tracker_model.eval()
         logger.info("SAM3 Tracker loaded successfully")
     except Exception as e:
         logger.error(f"Tracker model loading failed: {e}")
+        logger.error("Make sure you have:")
+        logger.error("1. Requested access at: https://huggingface.co/facebook/sam3")
+        logger.error("2. Set HF_TOKEN environment variable with your Hugging Face token")
         raise
 
     try:
