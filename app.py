@@ -314,39 +314,27 @@ async def websocket_endpoint(websocket: WebSocket):
 
                                 inputs = tracker_processor(
                                     image,
-                                    input_points=[[points]],
-                                    input_labels=[[labels]],
+                                    input_points=[[[points]]],
+                                    input_labels=[[[labels]]],
                                     return_tensors="pt"
                                 ).to(tracker_model.device)
 
                                 with torch.no_grad():
                                     outputs = tracker_model(**inputs, multimask_output=False)
 
-                                pred_masks = outputs.pred_masks.cpu()
-
-                                if hasattr(tracker_processor, 'post_process_masks'):
-                                    original_size = inputs.get("original_sizes", torch.tensor([[image.height, image.width]]))
-                                    reshaped_size = inputs.get("reshaped_input_sizes", original_size)
-                                    masks = tracker_processor.post_process_masks(
-                                        pred_masks,
-                                        original_size.cpu(),
-                                        reshaped_size.cpu()
-                                    )[0]
-                                else:
-                                    masks = pred_masks
+                                masks = tracker_processor.post_process_masks(
+                                    outputs.pred_masks.cpu(),
+                                    inputs["original_sizes"]
+                                )[0]
 
                                 all_masks.append(masks)
 
-                            first_mask_shape = all_masks[0].shape
-                            if len(first_mask_shape) >= 3:
-                                composite_mask = np.zeros(first_mask_shape[-2:], dtype=bool)
-                                for masks in all_masks:
-                                    mask = masks.squeeze().numpy()
-                                    if mask.ndim > 2:
-                                        mask = mask[0]
-                                    composite_mask = composite_mask | (mask > 0.5)
-                            else:
-                                composite_mask = all_masks[0].squeeze().numpy() > 0.5
+                            first_mask = all_masks[0].squeeze().numpy()
+                            composite_mask = np.zeros_like(first_mask, dtype=bool)
+
+                            for masks in all_masks:
+                                mask = masks.squeeze().numpy()
+                                composite_mask = composite_mask | (mask > 0.5)
 
                             mask_b64 = masks_to_base64(np.array([composite_mask]))[0]
 
