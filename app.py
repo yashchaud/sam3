@@ -69,13 +69,11 @@ async def load_model():
         logger.info("Loading SAM3 Tracker model (required for WebSocket)...")
         tracker_model = Sam3TrackerModel.from_pretrained(
             "facebook/sam3",
-            token=hf_token,
-            use_auth_token=hf_token
+            token=hf_token
         ).to(device)
         tracker_processor = Sam3TrackerProcessor.from_pretrained(
             "facebook/sam3",
-            token=hf_token,
-            use_auth_token=hf_token
+            token=hf_token
         )
         tracker_model.eval()
         logger.info("SAM3 Tracker loaded successfully")
