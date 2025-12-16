@@ -314,8 +314,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
                                 inputs = tracker_processor(
                                     image,
-                                    input_points=[[[points]]],
-                                    input_labels=[[[labels]]],
+                                    input_points=[[points]],
+                                    input_labels=[[labels]],
                                     return_tensors="pt"
                                 ).to(tracker_model.device)
 
