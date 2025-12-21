@@ -262,6 +262,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     if label not in [0, 1]:
                         label = 1
 
+                    if label == 0 and len(session_data["objects"]) == 0:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Cannot add background point without any foreground points. Click a foreground point (label=1) first."
+                        })
+                        continue
+
                     assigned_to = None
                     min_distance = float('inf')
 
@@ -272,7 +279,19 @@ async def websocket_endpoint(websocket: WebSocket):
                                 min_distance = dist
                                 assigned_to = idx
 
-                    if min_distance <= PROXIMITY_THRESHOLD and assigned_to is not None:
+                    if label == 0:
+                        if assigned_to is None or min_distance > PROXIMITY_THRESHOLD:
+                            assigned_to = 0
+                        obj = session_data["objects"][assigned_to]
+                        if len(obj["points"]) >= MAX_POINTS_PER_OBJECT:
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": f"Max points per object ({MAX_POINTS_PER_OBJECT}) reached"
+                            })
+                            continue
+                        obj["points"].append([x, y])
+                        obj["labels"].append(label)
+                    elif min_distance <= PROXIMITY_THRESHOLD and assigned_to is not None:
                         obj = session_data["objects"][assigned_to]
                         if len(obj["points"]) >= MAX_POINTS_PER_OBJECT:
                             await websocket.send_json({
