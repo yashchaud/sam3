@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir runpod
 
 RUN git clone https://github.com/facebookresearch/sam3.git /tmp/sam3_repo && \
     cd /tmp/sam3_repo && \
-    pip install -e . && \
+    pip install --no-cache-dir . && \
     cd / && \
     rm -rf /tmp/sam3_repo
 
