@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,7 +11,9 @@ import os
 import uuid
 from datetime import datetime
 import torch
+import cv2
 from dotenv import load_dotenv
+from typing import List, Optional
 
 load_dotenv()
 
@@ -42,6 +44,8 @@ processor = None
 device = None
 tracker_model = None
 tracker_processor = None
+matting_model = None
+matting_processor = None
 realtime_sessions = {}
 
 MAX_SESSIONS = 100
@@ -140,6 +144,50 @@ def masks_to_base64(masks: np.ndarray) -> list:
 
     return result
 
+def load_matting_model():
+    global matting_model, matting_processor, device
+    if matting_model is not None:
+        return
+    from transformers import VitMatteForImageMatting, VitMatteImageProcessor
+    logger.info("Loading ViTMatte model...")
+    matting_processor = VitMatteImageProcessor.from_pretrained("hustvl/vitmatte-small-composition-1k")
+    matting_model = VitMatteForImageMatting.from_pretrained("hustvl/vitmatte-small-composition-1k").to(device)
+    matting_model.eval()
+    logger.info("ViTMatte loaded successfully")
+
+def generate_trimap(mask: np.ndarray, erode_size: int = 10, dilate_size: int = 10) -> np.ndarray:
+    mask_uint8 = (mask * 255).astype(np.uint8) if mask.dtype == bool else mask.astype(np.uint8)
+    kernel = np.ones((3, 3), np.uint8)
+    eroded = cv2.erode(mask_uint8, kernel, iterations=erode_size)
+    dilated = cv2.dilate(mask_uint8, kernel, iterations=dilate_size)
+    trimap = np.zeros_like(mask_uint8)
+    trimap[dilated > 127] = 128
+    trimap[eroded > 127] = 255
+    return trimap
+
+def apply_matting(image: Image.Image, mask: np.ndarray) -> np.ndarray:
+    load_matting_model()
+    trimap = generate_trimap(mask)
+    trimap_image = Image.fromarray(trimap, mode='L')
+    inputs = matting_processor(images=image, trimaps=trimap_image, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = matting_model(**inputs)
+    alpha = outputs.alphas[0, 0].cpu().numpy()
+    return (alpha * 255).astype(np.uint8)
+
+def extract_layer_rgba(image: Image.Image, alpha: np.ndarray) -> bytes:
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+    if alpha.shape != (h, w):
+        alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR)
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[:, :, :3] = img_array
+    rgba[:, :, 3] = alpha
+    rgba_image = Image.fromarray(rgba, mode='RGBA')
+    buffer = io.BytesIO()
+    rgba_image.save(buffer, format='PNG')
+    return buffer.getvalue()
+
 def cleanup_old_sessions():
     current_time = datetime.now()
     expired = [
@@ -167,7 +215,10 @@ async def root():
     return {
         "status": "ok",
         "service": "SAM3 Real-time Segmentation",
-        "websocket_endpoint": "/ws/realtime"
+        "endpoints": {
+            "websocket": "/ws/realtime",
+            "extract_layer": "POST /extract-layer"
+        }
     }
 
 @app.get("/health")
@@ -178,6 +229,69 @@ async def health():
         "device": str(device),
         "active_sessions": len(realtime_sessions)
     }
+
+@app.post("/extract-layer")
+async def extract_layer_endpoint(
+    image: str = Body(..., description="Base64 encoded image"),
+    points: List[List[int]] = Body(..., description="List of [x, y] coordinates"),
+    labels: List[int] = Body(..., description="List of labels (1=foreground, 0=background)"),
+    use_matting: bool = Body(False, description="Apply alpha matting for soft edges")
+):
+    """
+    Extract a layer with transparency from an image using SAM3 segmentation.
+    Optionally applies ViTMatte alpha matting for soft edges (hair, fur, etc).
+    """
+    if tracker_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    if not points:
+        raise HTTPException(status_code=400, detail="No points provided")
+
+    if len(points) != len(labels):
+        labels = [1] * len(points)
+
+    try:
+        image_bytes = decode_base64_image(image)
+        img = validate_image(image_bytes)
+
+        inputs = tracker_processor(
+            img,
+            input_points=[[points]],
+            input_labels=[[labels]],
+            return_tensors="pt"
+        ).to(tracker_model.device)
+
+        with torch.no_grad():
+            outputs = tracker_model(**inputs, multimask_output=False)
+
+        masks = tracker_processor.post_process_masks(
+            outputs.pred_masks.cpu(),
+            inputs["original_sizes"]
+        )[0]
+
+        mask = masks.squeeze().numpy()
+        mask_binary = mask > 0.5
+
+        if use_matting:
+            alpha = apply_matting(img, mask_binary)
+        else:
+            alpha = (mask_binary * 255).astype(np.uint8)
+
+        layer_bytes = extract_layer_rgba(img, alpha)
+        layer_b64 = base64.b64encode(layer_bytes).decode('utf-8')
+
+        return {
+            "layer": layer_b64,
+            "width": img.width,
+            "height": img.height,
+            "use_matting": use_matting
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Extract layer error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/app", response_class=HTMLResponse)
 async def serve_app():
