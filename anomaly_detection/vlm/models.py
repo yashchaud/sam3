@@ -54,7 +54,7 @@ class VLMConfig:
     grid_config: GridConfig = field(default_factory=GridConfig)
     process_every_n_frames: int = 10
     max_generation_frames: int = 60
-    timeout_seconds: float = 2.0
+    timeout_seconds: float = 30.0  # Increased for VLM API calls (can take 5-15s)
 
     # Output preferences
     prefer_boxes: bool = True
