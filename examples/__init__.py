@@ -1,1 +1,1 @@
-# Examples package
+"""Example scripts for anomaly detection."""

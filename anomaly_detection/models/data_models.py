@@ -1,300 +1,239 @@
-"""
-Core data models for the anomaly detection pipeline.
-
-All data structures are immutable dataclasses to ensure
-predictable data flow and easy debugging.
-"""
+"""Core data models for anomaly detection pipeline."""
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 from pathlib import Path
 import numpy as np
-from datetime import datetime
+import time
 import uuid
 
 
 class DetectionType(Enum):
-    """
-    Classification of detected objects.
-
-    STRUCTURE: Structural elements (beams, columns, walls, pipes, etc.)
-    ANOMALY: Potential defects (cracks, corrosion, deformation, etc.)
-    """
+    """Type of detection."""
     STRUCTURE = "structure"
     ANOMALY = "anomaly"
 
 
 @dataclass(frozen=True)
 class BoundingBox:
-    """
-    Axis-aligned bounding box in pixel coordinates.
-
-    Uses (x_min, y_min, x_max, y_max) format for consistency
-    with most detection frameworks.
-    """
-    x_min: float
-    y_min: float
-    x_max: float
-    y_max: float
+    """Immutable bounding box coordinates."""
+    x_min: int
+    y_min: int
+    x_max: int
+    y_max: int
 
     def __post_init__(self):
         if self.x_min > self.x_max:
-            raise ValueError(f"x_min ({self.x_min}) > x_max ({self.x_max})")
+            object.__setattr__(self, 'x_min', self.x_max)
+            object.__setattr__(self, 'x_max', self.x_min)
         if self.y_min > self.y_max:
-            raise ValueError(f"y_min ({self.y_min}) > y_max ({self.y_max})")
+            object.__setattr__(self, 'y_min', self.y_max)
+            object.__setattr__(self, 'y_max', self.y_min)
 
     @property
-    def width(self) -> float:
+    def width(self) -> int:
         return self.x_max - self.x_min
 
     @property
-    def height(self) -> float:
+    def height(self) -> int:
         return self.y_max - self.y_min
 
     @property
-    def area(self) -> float:
+    def area(self) -> int:
         return self.width * self.height
 
     @property
-    def center(self) -> tuple[float, float]:
+    def center(self) -> tuple[int, int]:
         return (
-            (self.x_min + self.x_max) / 2,
-            (self.y_min + self.y_max) / 2
+            (self.x_min + self.x_max) // 2,
+            (self.y_min + self.y_max) // 2,
         )
 
-    def to_xyxy(self) -> tuple[float, float, float, float]:
-        """Return as (x_min, y_min, x_max, y_max) tuple."""
-        return (self.x_min, self.y_min, self.x_max, self.y_max)
-
-    def to_xywh(self) -> tuple[float, float, float, float]:
-        """Return as (x_min, y_min, width, height) tuple."""
-        return (self.x_min, self.y_min, self.width, self.height)
-
     def iou(self, other: "BoundingBox") -> float:
-        """Compute Intersection over Union with another box."""
-        inter_x_min = max(self.x_min, other.x_min)
-        inter_y_min = max(self.y_min, other.y_min)
-        inter_x_max = min(self.x_max, other.x_max)
-        inter_y_max = min(self.y_max, other.y_max)
+        """Calculate Intersection over Union with another box."""
+        x_min = max(self.x_min, other.x_min)
+        y_min = max(self.y_min, other.y_min)
+        x_max = min(self.x_max, other.x_max)
+        y_max = min(self.y_max, other.y_max)
 
-        if inter_x_min >= inter_x_max or inter_y_min >= inter_y_max:
+        if x_min >= x_max or y_min >= y_max:
             return 0.0
 
-        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
-        union_area = self.area + other.area - inter_area
+        intersection = (x_max - x_min) * (y_max - y_min)
+        union = self.area + other.area - intersection
 
-        return inter_area / union_area if union_area > 0 else 0.0
+        return intersection / union if union > 0 else 0.0
 
-    def contains_point(self, x: float, y: float) -> bool:
-        """Check if point (x, y) is inside the box."""
+    def contains_point(self, x: int, y: int) -> bool:
+        """Check if point is inside box."""
         return self.x_min <= x <= self.x_max and self.y_min <= y <= self.y_max
 
+    def to_xyxy(self) -> tuple[int, int, int, int]:
+        """Return as (x_min, y_min, x_max, y_max)."""
+        return (self.x_min, self.y_min, self.x_max, self.y_max)
 
-@dataclass(frozen=True)
+    def to_xywh(self) -> tuple[int, int, int, int]:
+        """Return as (x_min, y_min, width, height)."""
+        return (self.x_min, self.y_min, self.width, self.height)
+
+    def scale(self, factor: float) -> "BoundingBox":
+        """Scale box by factor around center."""
+        cx, cy = self.center
+        half_w = int(self.width * factor / 2)
+        half_h = int(self.height * factor / 2)
+        return BoundingBox(
+            x_min=cx - half_w,
+            y_min=cy - half_h,
+            x_max=cx + half_w,
+            y_max=cy + half_h,
+        )
+
+
+@dataclass
 class Detection:
-    """
-    A single detection from RT-DETR.
-
-    Represents either a structural element or an anomaly candidate
-    before segmentation refinement.
-    """
+    """Single detection from object detector."""
     detection_id: str
     detection_type: DetectionType
-    class_name: str  # e.g., "crack", "corrosion", "beam", "column"
+    class_name: str
     confidence: float
     bbox: BoundingBox
 
     def __post_init__(self):
         if not 0.0 <= self.confidence <= 1.0:
-            raise ValueError(f"Confidence must be in [0, 1], got {self.confidence}")
+            self.confidence = max(0.0, min(1.0, self.confidence))
 
 
 @dataclass
 class SegmentationMask:
-    """
-    Binary segmentation mask from SAM3.
-
-    The mask is stored as a numpy array where:
-    - 1 (True) = anomaly pixel
-    - 0 (False) = background pixel
-
-    For memory efficiency in production, masks can optionally
-    be saved to disk and loaded on demand.
-    """
-    mask: np.ndarray  # Shape: (H, W), dtype: bool or uint8
-    mask_path: Optional[Path] = None  # If saved to disk
-    sam_score: float = 0.0  # SAM's internal quality score
-
-    def __post_init__(self):
-        if self.mask.ndim != 2:
-            raise ValueError(f"Mask must be 2D, got shape {self.mask.shape}")
+    """Binary segmentation mask."""
+    data: np.ndarray  # (H, W) binary mask
+    mask_path: Path | None = None
+    sam_score: float | None = None
 
     @property
-    def height(self) -> int:
-        return self.mask.shape[0]
-
-    @property
-    def width(self) -> int:
-        return self.mask.shape[1]
-
     def pixel_count(self) -> int:
-        """Number of positive pixels in mask."""
-        return int(np.sum(self.mask > 0))
+        return int(np.sum(self.data > 0))
 
-    def to_binary(self) -> np.ndarray:
-        """Return mask as boolean array."""
-        return self.mask.astype(bool)
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.data.shape[:2]
+
+    def to_binary(self, threshold: float = 0.5) -> np.ndarray:
+        """Return binary mask."""
+        return (self.data > threshold).astype(np.uint8)
 
 
 @dataclass(frozen=True)
 class GeometryProperties:
-    """
-    Basic geometric properties extracted from a segmentation mask.
+    """Geometric properties extracted from mask."""
+    area_pixels: int
+    perimeter_pixels: float
+    length_pixels: float
+    width_pixels: float
+    orientation_degrees: float  # -90 to 90
+    aspect_ratio: float
+    solidity: float
+    centroid_x: float
+    centroid_y: float
 
-    All measurements are in pixels. Conversion to real-world units
-    requires camera calibration (out of scope for Phase-1).
-    """
-    area_pixels: int  # Total pixel count
-    perimeter_pixels: float  # Contour length
-    length_pixels: float  # Major axis of fitted ellipse
-    width_pixels: float  # Minor axis of fitted ellipse
-    orientation_degrees: float  # Angle of major axis, [-90, 90]
-    aspect_ratio: float  # length / width
-    solidity: float  # area / convex_hull_area, measures compactness
-    centroid: tuple[float, float]  # (x, y) center of mass
-
-    def __post_init__(self):
-        if self.area_pixels < 0:
-            raise ValueError(f"Area cannot be negative: {self.area_pixels}")
-        if self.aspect_ratio < 0:
-            raise ValueError(f"Aspect ratio cannot be negative: {self.aspect_ratio}")
+    def to_dict(self) -> dict:
+        return {
+            "area_pixels": self.area_pixels,
+            "perimeter_pixels": round(self.perimeter_pixels, 2),
+            "length_pixels": round(self.length_pixels, 2),
+            "width_pixels": round(self.width_pixels, 2),
+            "orientation_degrees": round(self.orientation_degrees, 2),
+            "aspect_ratio": round(self.aspect_ratio, 3),
+            "solidity": round(self.solidity, 3),
+            "centroid": [round(self.centroid_x, 2), round(self.centroid_y, 2)],
+        }
 
 
-@dataclass(frozen=True)
+@dataclass
 class AnomalyResult:
-    """
-    A fully processed anomaly with all associated data.
-
-    This is the primary output unit of the Phase-1 pipeline.
-    """
-    # Identifiers
+    """Complete result for a detected anomaly."""
     anomaly_id: str
     frame_id: str
-    timestamp: datetime
-
-    # Classification
-    defect_type: str  # e.g., "crack", "corrosion", "spalling"
-    structure_type: Optional[str]  # e.g., "beam", "column", None if unassociated
-    structure_id: Optional[str]  # ID of associated structure detection
-
-    # Spatial data
+    timestamp: float
+    defect_type: str
+    structure_type: str | None
     bbox: BoundingBox
-    mask: SegmentationMask
-    geometry: GeometryProperties
+    mask: SegmentationMask | None
+    geometry: GeometryProperties | None
 
-    # Confidence scores
-    detection_confidence: float  # From RT-DETR
-    segmentation_confidence: float  # From SAM3
-    association_confidence: Optional[float]  # From structure matching
+    detection_confidence: float = 0.0
+    segmentation_confidence: float = 0.0
+    association_confidence: float = 0.0
 
     @property
     def combined_confidence(self) -> float:
-        """
-        Aggregate confidence score.
-
-        Simple geometric mean of available confidences.
-        More sophisticated fusion can be added in later phases.
-        """
-        scores = [self.detection_confidence, self.segmentation_confidence]
-        if self.association_confidence is not None:
+        """Geometric mean of all confidences."""
+        scores = [self.detection_confidence]
+        if self.segmentation_confidence > 0:
+            scores.append(self.segmentation_confidence)
+        if self.association_confidence > 0:
             scores.append(self.association_confidence)
+
+        if not scores:
+            return 0.0
 
         product = 1.0
         for s in scores:
             product *= s
         return product ** (1.0 / len(scores))
 
+    def to_dict(self) -> dict:
+        return {
+            "anomaly_id": self.anomaly_id,
+            "frame_id": self.frame_id,
+            "timestamp": self.timestamp,
+            "defect_type": self.defect_type,
+            "structure_type": self.structure_type,
+            "bbox": self.bbox.to_xyxy(),
+            "geometry": self.geometry.to_dict() if self.geometry else None,
+            "confidence": {
+                "detection": round(self.detection_confidence, 3),
+                "segmentation": round(self.segmentation_confidence, 3),
+                "association": round(self.association_confidence, 3),
+                "combined": round(self.combined_confidence, 3),
+            },
+        }
+
 
 @dataclass
 class PipelineOutput:
-    """
-    Complete output from the Phase-1 pipeline for a single image/frame.
-    """
-    # Input metadata
-    frame_id: str
-    source_path: Optional[Path]
-    image_width: int
-    image_height: int
-    timestamp: datetime
-
-    # Results
+    """Output from processing a single image/frame."""
     anomalies: list[AnomalyResult] = field(default_factory=list)
-    structures: list[Detection] = field(default_factory=list)  # For reference
+    structures: list[Detection] = field(default_factory=list)
 
-    # Processing metadata
+    frame_id: str = ""
+    source_path: str | None = None
+    image_width: int = 0
+    image_height: int = 0
+    timestamp: float = field(default_factory=time.time)
+
     processing_time_ms: float = 0.0
     detector_time_ms: float = 0.0
     segmenter_time_ms: float = 0.0
 
-    @property
-    def anomaly_count(self) -> int:
-        return len(self.anomalies)
-
     def to_dict(self) -> dict:
-        """
-        Serialize to dictionary for JSON export.
-
-        Note: Masks are not included directly; use mask_path if available.
-        """
         return {
             "frame_id": self.frame_id,
-            "source_path": str(self.source_path) if self.source_path else None,
-            "image_width": self.image_width,
-            "image_height": self.image_height,
-            "timestamp": self.timestamp.isoformat(),
-            "anomaly_count": self.anomaly_count,
-            "anomalies": [
-                {
-                    "anomaly_id": a.anomaly_id,
-                    "defect_type": a.defect_type,
-                    "structure_type": a.structure_type,
-                    "structure_id": a.structure_id,
-                    "bbox": a.bbox.to_xyxy(),
-                    "mask_path": str(a.mask.mask_path) if a.mask.mask_path else None,
-                    "geometry": {
-                        "area_pixels": a.geometry.area_pixels,
-                        "perimeter_pixels": a.geometry.perimeter_pixels,
-                        "length_pixels": a.geometry.length_pixels,
-                        "width_pixels": a.geometry.width_pixels,
-                        "orientation_degrees": a.geometry.orientation_degrees,
-                        "aspect_ratio": a.geometry.aspect_ratio,
-                        "solidity": a.geometry.solidity,
-                        "centroid": a.geometry.centroid,
-                    },
-                    "detection_confidence": a.detection_confidence,
-                    "segmentation_confidence": a.segmentation_confidence,
-                    "association_confidence": a.association_confidence,
-                    "combined_confidence": a.combined_confidence,
-                }
-                for a in self.anomalies
-            ],
+            "source_path": self.source_path,
+            "dimensions": [self.image_width, self.image_height],
+            "timestamp": self.timestamp,
+            "anomalies": [a.to_dict() for a in self.anomalies],
             "structures": [
                 {
-                    "detection_id": s.detection_id,
                     "class_name": s.class_name,
-                    "confidence": s.confidence,
+                    "confidence": round(s.confidence, 3),
                     "bbox": s.bbox.to_xyxy(),
                 }
                 for s in self.structures
             ],
-            "processing_time_ms": self.processing_time_ms,
+            "timing": {
+                "total_ms": round(self.processing_time_ms, 2),
+                "detector_ms": round(self.detector_time_ms, 2),
+                "segmenter_ms": round(self.segmenter_time_ms, 2),
+            },
         }
-
-
-def generate_id(prefix: str = "") -> str:
-    """Generate a unique ID with optional prefix."""
-    short_uuid = str(uuid.uuid4())[:8]
-    if prefix:
-        return f"{prefix}_{short_uuid}"
-    return short_uuid

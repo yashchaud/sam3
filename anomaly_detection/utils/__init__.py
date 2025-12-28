@@ -1,10 +1,11 @@
-"""Utility modules."""
+"""Utility functions."""
 
-from anomaly_detection.utils.image_utils import (
+from .image_utils import (
     load_image,
     save_image,
     ensure_rgb,
     resize_for_inference,
+    validate_image,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "save_image",
     "ensure_rgb",
     "resize_for_inference",
+    "validate_image",
 ]

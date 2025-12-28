@@ -1,71 +1,50 @@
-"""
-Image loading and preprocessing utilities.
-
-Provides consistent image handling across the pipeline.
-"""
+"""Image I/O and manipulation utilities."""
 
 from pathlib import Path
-from typing import Union, Optional, Tuple
 import numpy as np
+import cv2
 
 
-def load_image(
-    path: Union[str, Path],
-    mode: str = "rgb",
-) -> np.ndarray:
+def load_image(path: str | Path, mode: str = "rgb") -> np.ndarray:
     """
-    Load an image from disk.
+    Load image from disk.
 
     Args:
         path: Path to image file
-        mode: Color mode - 'rgb', 'bgr', or 'gray'
+        mode: 'rgb', 'bgr', or 'gray'
 
     Returns:
         Image as numpy array
-
-    Raises:
-        FileNotFoundError: If image file doesn't exist
-        ValueError: If image cannot be loaded
     """
-    import cv2
-
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Image not found: {path}")
 
-    if mode == "gray":
-        image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    else:
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-
+    image = cv2.imread(str(path))
     if image is None:
         raise ValueError(f"Failed to load image: {path}")
 
-    if mode == "rgb" and image.ndim == 3:
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    if mode == "rgb":
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    elif mode == "gray":
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:  # bgr
+        return image
 
-    return image
 
-
-def save_image(
-    image: np.ndarray,
-    path: Union[str, Path],
-    mode: str = "rgb",
-) -> None:
+def save_image(image: np.ndarray, path: str | Path, mode: str = "rgb") -> None:
     """
-    Save an image to disk.
+    Save image to disk.
 
     Args:
-        image: Image array to save
-        path: Output file path
-        mode: Color mode of input - 'rgb' or 'bgr'
+        image: Image array
+        path: Output path
+        mode: Input mode ('rgb' or 'bgr')
     """
-    import cv2
-
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    if mode == "rgb" and image.ndim == 3:
+    if mode == "rgb" and len(image.shape) == 3:
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
     cv2.imwrite(str(path), image)
@@ -77,20 +56,15 @@ def ensure_rgb(image: np.ndarray, source_mode: str = "bgr") -> np.ndarray:
 
     Args:
         image: Input image
-        source_mode: Current color mode ('bgr' or 'rgb')
+        source_mode: Current mode ('bgr' or 'gray')
 
     Returns:
-        Image in RGB format
+        RGB image
     """
-    import cv2
-
-    if image.ndim == 2:
-        # Grayscale to RGB
+    if len(image.shape) == 2:
         return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-
-    if source_mode == "bgr":
+    elif source_mode == "bgr":
         return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
     return image
 
 
@@ -98,25 +72,23 @@ def resize_for_inference(
     image: np.ndarray,
     max_size: int = 1024,
     min_size: int = 512,
-) -> Tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float]:
     """
-    Resize image for model inference while maintaining aspect ratio.
+    Resize image for inference while maintaining aspect ratio.
 
     Args:
-        image: Input image (H, W, C)
-        max_size: Maximum dimension size
-        min_size: Minimum dimension size
+        image: Input image
+        max_size: Maximum dimension
+        min_size: Minimum dimension
 
     Returns:
-        Tuple of (resized image, scale factor)
+        (resized_image, scale_factor)
     """
-    import cv2
-
     h, w = image.shape[:2]
     max_dim = max(h, w)
     min_dim = min(h, w)
 
-    # Determine scale factor
+    # Calculate scale
     if max_dim > max_size:
         scale = max_size / max_dim
     elif min_dim < min_size:
@@ -131,24 +103,113 @@ def resize_for_inference(
     return resized, scale
 
 
-def validate_image(image: np.ndarray) -> None:
+def validate_image(image: np.ndarray) -> list[str]:
     """
     Validate image array format.
 
     Args:
         image: Image to validate
 
-    Raises:
-        ValueError: If image format is invalid
+    Returns:
+        List of validation errors (empty if valid)
     """
+    errors = []
+
     if not isinstance(image, np.ndarray):
-        raise ValueError(f"Expected numpy array, got {type(image)}")
+        errors.append("Image must be numpy array")
+        return errors
 
-    if image.ndim not in (2, 3):
-        raise ValueError(f"Expected 2D or 3D array, got shape {image.shape}")
+    if len(image.shape) not in [2, 3]:
+        errors.append(f"Invalid dimensions: {image.shape}")
 
-    if image.ndim == 3 and image.shape[2] not in (1, 3, 4):
-        raise ValueError(f"Expected 1, 3, or 4 channels, got {image.shape[2]}")
+    if len(image.shape) == 3 and image.shape[2] not in [1, 3, 4]:
+        errors.append(f"Invalid channels: {image.shape[2]}")
 
     if image.size == 0:
-        raise ValueError("Empty image array")
+        errors.append("Image is empty")
+
+    return errors
+
+
+def draw_detections(
+    image: np.ndarray,
+    detections: list,
+    color: tuple[int, int, int] = (0, 255, 0),
+    thickness: int = 2,
+) -> np.ndarray:
+    """
+    Draw detection bounding boxes on image.
+
+    Args:
+        image: RGB image
+        detections: List of Detection objects
+        color: Box color (RGB)
+        thickness: Line thickness
+
+    Returns:
+        Image with boxes drawn
+    """
+    output = image.copy()
+
+    for det in detections:
+        bbox = det.bbox
+        cv2.rectangle(
+            output,
+            (bbox.x_min, bbox.y_min),
+            (bbox.x_max, bbox.y_max),
+            color,
+            thickness,
+        )
+
+        # Draw label
+        label = f"{det.class_name}: {det.confidence:.2f}"
+        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+
+        cv2.rectangle(
+            output,
+            (bbox.x_min, bbox.y_min - text_h - 4),
+            (bbox.x_min + text_w, bbox.y_min),
+            color,
+            -1,
+        )
+        cv2.putText(
+            output,
+            label,
+            (bbox.x_min, bbox.y_min - 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+        )
+
+    return output
+
+
+def draw_mask_overlay(
+    image: np.ndarray,
+    mask: np.ndarray,
+    color: tuple[int, int, int] = (255, 0, 0),
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """
+    Overlay mask on image with transparency.
+
+    Args:
+        image: RGB image
+        mask: Binary mask
+        color: Overlay color (RGB)
+        alpha: Transparency (0-1)
+
+    Returns:
+        Image with mask overlay
+    """
+    output = image.copy()
+
+    # Create colored overlay
+    overlay = np.zeros_like(image)
+    overlay[mask > 0] = color
+
+    # Blend
+    output = cv2.addWeighted(output, 1, overlay, alpha, 0)
+
+    return output

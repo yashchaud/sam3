@@ -1,88 +1,76 @@
-"""
-Default configuration and environment-based settings.
+"""Configuration management for anomaly detection."""
 
-Provides sensible defaults for production deployment.
-"""
-
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-import os
+
+
+# Default class mappings
+DEFAULT_STRUCTURE_CLASSES = {
+    "beam", "column", "wall", "slab", "pipe",
+    "foundation", "joint", "girder", "truss", "deck",
+}
+
+DEFAULT_ANOMALY_CLASSES = {
+    "crack", "corrosion", "spalling", "deformation", "stain",
+    "efflorescence", "exposed_rebar", "delamination", "scaling",
+    "popout", "honeycomb", "rust",
+}
+
+# Performance constants
+MAX_IMAGE_SIZE = 2048
+MIN_MASK_AREA = 10
+DEFAULT_BATCH_SIZE = 4
 
 
 @dataclass
 class EnvironmentConfig:
-    """
-    Configuration loaded from environment variables.
-
-    Environment variables:
-        ANOMALY_DETECTOR_MODEL: Path to RT-DETR model
-        ANOMALY_SEGMENTER_MODEL: Path to SAM3 model
-        ANOMALY_DEVICE: Compute device (cuda/cpu/auto)
-        ANOMALY_CONFIDENCE_THRESHOLD: Detection threshold
-        ANOMALY_MASK_OUTPUT_DIR: Directory for mask outputs
-    """
-    detector_model_path: Path
-    segmenter_model_path: Path
+    """Configuration loaded from environment variables."""
+    detector_model_path: Path | None = None
+    segmenter_model_path: Path | None = None
     device: str = "auto"
     confidence_threshold: float = 0.3
-    mask_output_dir: Optional[Path] = None
+    mask_output_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> "EnvironmentConfig":
         """Load configuration from environment variables."""
         detector_path = os.environ.get("ANOMALY_DETECTOR_MODEL")
         segmenter_path = os.environ.get("ANOMALY_SEGMENTER_MODEL")
-
-        if detector_path is None:
-            raise ValueError("ANOMALY_DETECTOR_MODEL environment variable required")
-        if segmenter_path is None:
-            raise ValueError("ANOMALY_SEGMENTER_MODEL environment variable required")
-
+        device = os.environ.get("ANOMALY_DEVICE", "auto")
+        confidence = float(os.environ.get("ANOMALY_CONFIDENCE_THRESHOLD", "0.3"))
         mask_dir = os.environ.get("ANOMALY_MASK_OUTPUT_DIR")
 
         return cls(
-            detector_model_path=Path(detector_path),
-            segmenter_model_path=Path(segmenter_path),
-            device=os.environ.get("ANOMALY_DEVICE", "auto"),
-            confidence_threshold=float(
-                os.environ.get("ANOMALY_CONFIDENCE_THRESHOLD", "0.3")
-            ),
+            detector_model_path=Path(detector_path) if detector_path else None,
+            segmenter_model_path=Path(segmenter_path) if segmenter_path else None,
+            device=device,
+            confidence_threshold=confidence,
             mask_output_dir=Path(mask_dir) if mask_dir else None,
         )
 
+    def validate(self) -> list[str]:
+        """Validate configuration and return list of errors."""
+        errors = []
 
-# Default class mappings for structural inspection
-DEFAULT_STRUCTURE_CLASSES = (
-    "beam",
-    "column",
-    "wall",
-    "slab",
-    "pipe",
-    "foundation",
-    "joint",
-    "girder",
-    "truss",
-    "deck",
-)
+        if self.detector_model_path and not self.detector_model_path.exists():
+            errors.append(f"Detector model not found: {self.detector_model_path}")
 
-DEFAULT_ANOMALY_CLASSES = (
-    "crack",
-    "corrosion",
-    "spalling",
-    "deformation",
-    "stain",
-    "efflorescence",
-    "exposed_rebar",
-    "delamination",
-    "scaling",
-    "popout",
-    "honeycomb",
-    "rust",
-)
+        if self.segmenter_model_path and not self.segmenter_model_path.exists():
+            errors.append(f"Segmenter model not found: {self.segmenter_model_path}")
+
+        if not 0.0 <= self.confidence_threshold <= 1.0:
+            errors.append(f"Invalid confidence threshold: {self.confidence_threshold}")
+
+        return errors
 
 
-# Performance constants
-MAX_IMAGE_SIZE = 2048  # Maximum dimension for processing
-MIN_MASK_AREA = 10  # Minimum pixels for valid mask
-DEFAULT_BATCH_SIZE = 4  # For batch processing
+def get_device(preference: str = "auto") -> str:
+    """Determine device to use based on preference and availability."""
+    if preference == "auto":
+        try:
+            import torch
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            return "cpu"
+    return preference

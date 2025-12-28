@@ -1,5 +1,8 @@
-"""Geometry extraction module for segmentation masks."""
+"""Geometry extraction module."""
 
-from anomaly_detection.geometry.mask_geometry import MaskGeometryExtractor
+from .mask_geometry import GeometryConfig, MaskGeometryExtractor
 
-__all__ = ["MaskGeometryExtractor"]
+__all__ = [
+    "GeometryConfig",
+    "MaskGeometryExtractor",
+]

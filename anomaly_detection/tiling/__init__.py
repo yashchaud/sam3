@@ -1,31 +1,13 @@
-"""Image tiling utilities for processing large images."""
+"""Image tiling module for large images."""
 
-from anomaly_detection.tiling.tiler import (
-    TileInfo,
-    TileConfig,
-    ImageTiler,
-)
-from anomaly_detection.tiling.coordinator import TiledDetectionCoordinator
-from anomaly_detection.tiling.temporal_tiler import (
-    TemporalTileConfig,
-    TemporalTileManager,
-    FrameType,
-    FrameStrategy,
-    AccumulatedDetection,
-    CycleResult,
-)
+from .tiler import TileInfo, TileConfig, ImageTiler
+from .coordinator import TiledDetectionCoordinator, TiledSegmentationResult, TiledDetection
 
 __all__ = [
-    # Static tiling
     "TileInfo",
     "TileConfig",
     "ImageTiler",
     "TiledDetectionCoordinator",
-    # Temporal/video tiling
-    "TemporalTileConfig",
-    "TemporalTileManager",
-    "FrameType",
-    "FrameStrategy",
-    "AccumulatedDetection",
-    "CycleResult",
+    "TiledSegmentationResult",
+    "TiledDetection",
 ]

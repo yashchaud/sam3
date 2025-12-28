@@ -1,8 +1,15 @@
 """Structure-defect association module."""
 
-from anomaly_detection.association.structure_defect_matcher import (
-    StructureDefectMatcher,
+from .structure_defect_matcher import (
+    MatchStrategy,
+    MatcherConfig,
     MatchResult,
+    StructureDefectMatcher,
 )
 
-__all__ = ["StructureDefectMatcher", "MatchResult"]
+__all__ = [
+    "MatchStrategy",
+    "MatcherConfig",
+    "MatchResult",
+    "StructureDefectMatcher",
+]

@@ -1,9 +1,9 @@
-"""Data models for the anomaly detection system."""
+"""Data models for anomaly detection."""
 
-from anomaly_detection.models.data_models import (
+from .data_models import (
+    DetectionType,
     BoundingBox,
     Detection,
-    DetectionType,
     SegmentationMask,
     GeometryProperties,
     AnomalyResult,
@@ -11,9 +11,9 @@ from anomaly_detection.models.data_models import (
 )
 
 __all__ = [
+    "DetectionType",
     "BoundingBox",
     "Detection",
-    "DetectionType",
     "SegmentationMask",
     "GeometryProperties",
     "AnomalyResult",

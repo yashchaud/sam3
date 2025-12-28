@@ -1,85 +1,36 @@
-# Phase-1 Anomaly Detection Requirements
-# =======================================
-
 # Core dependencies
-numpy>=1.26.0,<2  # SAM3 requires numpy 1.26+, <2
+numpy>=1.26.0,<2
 opencv-python>=4.8.0
 Pillow>=10.0.0
-supervision>=0.21.0  # For RF-DETR detection output handling
 
-# ML framework (SAM3 requires PyTorch 2.7+)
-# See: https://pytorch.org/get-started/locally/
+# Deep learning
 torch>=2.7.0
 torchvision>=0.20.0
 
-# SAM3 core dependencies
-timm>=1.0.17
-tqdm
-ftfy==6.1.1
-regex
-iopath>=0.1.10
-typing_extensions
-huggingface_hub
-decord
-einops
+# Detection - RF-DETR (Apache 2.0)
+rfdetr>=1.2.0
 
-# API Server dependencies
+# Segmentation - SAM2/SAM3 (install from GitHub)
+# pip install git+https://github.com/facebookresearch/sam2.git
+timm>=0.9.0
+einops>=0.7.0
+huggingface_hub>=0.20.0
+
+# VLM - Qwen support
+transformers>=4.40.0
+accelerate>=0.25.0
+aiohttp>=3.9.0
+
+# API and utilities
 fastapi>=0.109.0
 uvicorn>=0.27.0
 python-multipart>=0.0.6
+websockets>=12.0
 pydantic>=2.0.0
-httpx>=0.27.0  # For URL-based image fetching
 
-# RunPod (for serverless deployment)
-runpod>=1.6.0
+# Optional: RunPod serverless
+# runpod>=1.6.0
 
-# ─────────────────────────────────────────────────────────────────
-# Detection: RF-DETR (Apache 2.0 License)
-# ─────────────────────────────────────────────────────────────────
-# RF-DETR is a state-of-the-art real-time detection transformer
-# developed by Roboflow. First model to exceed 60 AP on COCO.
-#
-# Install:
-rfdetr>=1.2.0
-#
-# Available variants:
-#   ┌──────────┬────────┬──────────┬─────────────┐
-#   │ Variant  │ AP₅₀   │ AP₅₀:₉₅  │ Latency(ms) │
-#   ├──────────┼────────┼──────────┼─────────────┤
-#   │ Nano     │ 67.6   │ 48.4     │ 2.32        │
-#   │ Small    │ 72.1   │ 53.0     │ 3.52        │
-#   │ Medium   │ 73.6   │ 54.7     │ 4.52        │ ← Default
-#   │ Large    │ 75.6   │ 56.7     │ 9.64        │
-#   └──────────┴────────┴──────────┴─────────────┘
-#
-# Source: https://github.com/roboflow/rf-detr
-
-# ─────────────────────────────────────────────────────────────────
-# Segmentation: SAM3 (SAM License)
-# ─────────────────────────────────────────────────────────────────
-# SAM3 is Meta's latest Segment Anything Model with concept prompts.
-#
-# Install SAM3 from source:
-#   pip install git+https://github.com/facebookresearch/sam3.git
-#
-# Weights require access request:
-#   https://huggingface.co/facebook/sam3
-#
-# Fallback to SAM2 if SAM3 unavailable:
-#   pip install git+https://github.com/facebookresearch/sam2.git
-
-# ─────────────────────────────────────────────────────────────────
-# License Summary
-# ─────────────────────────────────────────────────────────────────
-#
-# RF-DETR:
-#   License: Apache 2.0
-#   Commercial: Full commercial use permitted
-#   Source: https://github.com/roboflow/rf-detr
-#
-# SAM3:
-#   License: SAM License (custom Meta license)
-#   Commercial: Permitted with restrictions:
-#     - No military, nuclear, espionage use
-#     - No sanctioned entity use
-#   Source: https://github.com/facebookresearch/sam3/blob/main/LICENSE
+# Development
+pytest>=7.0.0
+pytest-asyncio>=0.21.0

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(dir \"c:\\\\anamalyDetection\"\")"
+      "Bash(dir /B \"c:\\\\anamalyDetection\")",
+      "Bash(dir /S /B \"c:\\\\anamalyDetection\\\\anomaly_detection\\\\*.py\")"
     ]
   }
 }

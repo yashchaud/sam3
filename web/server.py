@@ -1,0 +1,594 @@
+"""FastAPI server for anomaly detection web interface."""
+
+import asyncio
+import base64
+import io
+import json
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# Import our modules
+from anomaly_detection.realtime import RealtimeVideoProcessor, RealtimeConfig, FrameSource
+from anomaly_detection.vlm import VLMConfig, VLMProvider, GridConfig
+from anomaly_detection.utils import load_image, draw_detections, draw_mask_overlay
+
+
+app = FastAPI(title="Anomaly Detection", version="0.2.0")
+
+# CORS for development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global state
+processor: Optional[RealtimeVideoProcessor] = None
+processing_task: Optional[asyncio.Task] = None
+active_connections: list[WebSocket] = []
+
+
+# ============== Models ==============
+
+class ConfigRequest(BaseModel):
+    sam_model_path: str
+    detector_weights: Optional[str] = None
+    enable_vlm: bool = False
+    vlm_provider: str = "local"
+    openrouter_api_key: Optional[str] = None
+    vlm_every_n_frames: int = 10
+    confidence_threshold: float = 0.3
+    device: str = "auto"
+
+
+class ProcessingStatus(BaseModel):
+    is_running: bool
+    frames_processed: int
+    total_detections: int
+    current_fps: float
+    vlm_stats: dict
+
+
+# ============== State Management ==============
+
+@dataclass
+class AppState:
+    config: Optional[RealtimeConfig] = None
+    processor: Optional[RealtimeVideoProcessor] = None
+    is_processing: bool = False
+    current_video_path: Optional[str] = None
+    frames_processed: int = 0
+    total_detections: int = 0
+    results_buffer: list = field(default_factory=list)
+
+
+state = AppState()
+
+
+# ============== WebSocket Management ==============
+
+async def broadcast_message(message: dict):
+    """Send message to all connected WebSocket clients."""
+    disconnected = []
+    for ws in active_connections:
+        try:
+            await ws.send_json(message)
+        except Exception:
+            disconnected.append(ws)
+
+    for ws in disconnected:
+        active_connections.remove(ws)
+
+
+# ============== API Endpoints ==============
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """Serve the main web interface."""
+    html_path = Path(__file__).parent / "static" / "index.html"
+    if html_path.exists():
+        return HTMLResponse(content=html_path.read_text())
+    return HTMLResponse(content="<h1>Static files not found. Run from correct directory.</h1>")
+
+
+@app.post("/api/config")
+async def set_config(config: ConfigRequest):
+    """Set pipeline configuration."""
+    global state
+
+    try:
+        # Build VLM config
+        vlm_config = VLMConfig(
+            provider=VLMProvider.OPENROUTER if config.vlm_provider == "openrouter" else VLMProvider.LOCAL_QWEN,
+            openrouter_api_key=config.openrouter_api_key,
+            process_every_n_frames=config.vlm_every_n_frames,
+            max_generation_frames=60,
+            grid_config=GridConfig(cols=3, rows=3),
+        )
+
+        # Build main config
+        state.config = RealtimeConfig(
+            segmenter_model_path=Path(config.sam_model_path),
+            detector_weights=Path(config.detector_weights) if config.detector_weights else None,
+            enable_vlm_judge=config.enable_vlm,
+            vlm_config=vlm_config,
+            confidence_threshold=config.confidence_threshold,
+            device=config.device,
+        )
+
+        return {"status": "ok", "message": "Configuration set"}
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/load")
+async def load_models():
+    """Load all models into memory."""
+    global state
+
+    if state.config is None:
+        raise HTTPException(status_code=400, detail="Configuration not set")
+
+    try:
+        if state.processor is not None:
+            state.processor.unload()
+
+        state.processor = RealtimeVideoProcessor(state.config)
+        state.processor.load()
+
+        return {"status": "ok", "message": "Models loaded"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/unload")
+async def unload_models():
+    """Unload models from memory."""
+    global state
+
+    if state.processor is not None:
+        state.processor.unload()
+        state.processor = None
+
+    return {"status": "ok", "message": "Models unloaded"}
+
+
+@app.get("/api/status")
+async def get_status():
+    """Get current processing status."""
+    global state
+
+    vlm_stats = {}
+    if state.processor and hasattr(state.processor, '_vlm_judge') and state.processor._vlm_judge:
+        vlm_stats = state.processor._vlm_judge.get_stats()
+
+    return ProcessingStatus(
+        is_running=state.is_processing,
+        frames_processed=state.frames_processed,
+        total_detections=state.total_detections,
+        current_fps=state.processor.get_stats().avg_fps if state.processor else 0.0,
+        vlm_stats=vlm_stats,
+    )
+
+
+@app.post("/api/process/image")
+async def process_image(file: UploadFile = File(...)):
+    """Process a single uploaded image."""
+    global state
+
+    if state.processor is None or not state.processor.is_loaded():
+        raise HTTPException(status_code=400, detail="Models not loaded")
+
+    try:
+        # Read image
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Process
+        result = await state.processor.process_single_image(image, frame_id=file.filename)
+
+        # Draw annotations
+        annotated = image.copy()
+
+        # Draw masks
+        for anomaly in result.all_anomalies:
+            if anomaly.mask:
+                annotated = draw_mask_overlay(annotated, anomaly.mask.data, color=(255, 0, 0), alpha=0.4)
+
+        # Draw boxes for anomalies
+        for anomaly in result.all_anomalies:
+            cv2.rectangle(
+                annotated,
+                (anomaly.bbox.x_min, anomaly.bbox.y_min),
+                (anomaly.bbox.x_max, anomaly.bbox.y_max),
+                (255, 0, 0),
+                2,
+            )
+            label = f"{anomaly.defect_type}: {anomaly.detection_confidence:.0%}"
+            cv2.putText(annotated, label, (anomaly.bbox.x_min, anomaly.bbox.y_min - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+        # Draw structures
+        for struct in result.structures:
+            cv2.rectangle(
+                annotated,
+                (struct.bbox.x_min, struct.bbox.y_min),
+                (struct.bbox.x_max, struct.bbox.y_max),
+                (0, 255, 0),
+                2,
+            )
+
+        # Encode result image
+        annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+        _, buffer = cv2.imencode('.jpg', annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        return {
+            "status": "ok",
+            "image": f"data:image/jpeg;base64,{img_base64}",
+            "results": {
+                "anomalies": [a.to_dict() for a in result.all_anomalies],
+                "structures": [
+                    {"class_name": s.class_name, "confidence": s.confidence, "bbox": s.bbox.to_xyxy()}
+                    for s in result.structures
+                ],
+                "vlm_guided_count": len(result.vlm_guided_anomalies),
+                "timing_ms": result.total_time_ms,
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/process/video")
+async def process_video(file: UploadFile = File(...)):
+    """Upload and start processing a video file."""
+    global state
+
+    if state.processor is None or not state.processor.is_loaded():
+        raise HTTPException(status_code=400, detail="Models not loaded")
+
+    if state.is_processing:
+        raise HTTPException(status_code=400, detail="Already processing")
+
+    try:
+        # Save uploaded video
+        upload_dir = Path("uploads")
+        upload_dir.mkdir(exist_ok=True)
+
+        video_path = upload_dir / f"{uuid.uuid4()}_{file.filename}"
+
+        with open(video_path, "wb") as f:
+            contents = await file.read()
+            f.write(contents)
+
+        state.current_video_path = str(video_path)
+
+        # Start processing in background
+        asyncio.create_task(process_video_task(str(video_path)))
+
+        return {"status": "ok", "message": "Video processing started", "video_id": video_path.stem}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def process_video_task(video_path: str):
+    """Background task for video processing."""
+    global state
+
+    state.is_processing = True
+    state.frames_processed = 0
+    state.total_detections = 0
+    state.results_buffer = []
+
+    try:
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        await broadcast_message({
+            "type": "video_start",
+            "fps": fps,
+            "total_frames": total_frames,
+        })
+
+        frame_idx = 0
+
+        while cap.isOpened() and state.is_processing:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Process frame
+            result = await state.processor.process_single_image(
+                frame_rgb,
+                frame_id=f"frame_{frame_idx:06d}"
+            )
+
+            state.frames_processed = frame_idx + 1
+            state.total_detections += len(result.all_anomalies)
+
+            # Draw annotations
+            annotated = frame_rgb.copy()
+
+            for anomaly in result.all_anomalies:
+                if anomaly.mask is not None:
+                    annotated = draw_mask_overlay(annotated, anomaly.mask.data, color=(255, 0, 0), alpha=0.4)
+
+                cv2.rectangle(
+                    annotated,
+                    (anomaly.bbox.x_min, anomaly.bbox.y_min),
+                    (anomaly.bbox.x_max, anomaly.bbox.y_max),
+                    (255, 0, 0),
+                    2,
+                )
+
+            for struct in result.structures:
+                cv2.rectangle(
+                    annotated,
+                    (struct.bbox.x_min, struct.bbox.y_min),
+                    (struct.bbox.x_max, struct.bbox.y_max),
+                    (0, 255, 0),
+                    2,
+                )
+
+            # Encode frame
+            annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+            _, buffer = cv2.imencode('.jpg', annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+            # Broadcast to clients
+            await broadcast_message({
+                "type": "frame",
+                "frame_index": frame_idx,
+                "image": f"data:image/jpeg;base64,{img_base64}",
+                "anomaly_count": len(result.all_anomalies),
+                "vlm_guided_count": len(result.vlm_guided_anomalies),
+                "timing_ms": result.total_time_ms,
+                "progress": (frame_idx + 1) / total_frames,
+            })
+
+            frame_idx += 1
+
+            # Small delay to prevent overwhelming clients
+            await asyncio.sleep(0.01)
+
+        cap.release()
+
+        # Get final stats
+        stats = state.processor.get_stats()
+
+        await broadcast_message({
+            "type": "video_complete",
+            "frames_processed": state.frames_processed,
+            "total_detections": state.total_detections,
+            "avg_fps": stats.avg_fps,
+            "vlm_stats": stats.vlm_stats,
+        })
+
+    except Exception as e:
+        await broadcast_message({
+            "type": "error",
+            "message": str(e),
+        })
+
+    finally:
+        state.is_processing = False
+
+
+@app.post("/api/stop")
+async def stop_processing():
+    """Stop current video processing."""
+    global state
+    state.is_processing = False
+    return {"status": "ok", "message": "Processing stopped"}
+
+
+class StreamRequest(BaseModel):
+    source: str  # "webcam:0" or "rtsp://..."
+
+
+@app.post("/api/stream/start")
+async def start_stream(request: StreamRequest):
+    """Start processing from webcam or RTSP stream."""
+    global state
+
+    if state.processor is None or not state.processor.is_loaded():
+        raise HTTPException(status_code=400, detail="Models not loaded")
+
+    if state.is_processing:
+        raise HTTPException(status_code=400, detail="Already processing")
+
+    source = request.source
+
+    # Parse source
+    if source.startswith("webcam:"):
+        webcam_id = int(source.split(":")[1])
+        asyncio.create_task(process_stream_task(webcam_id, is_webcam=True))
+    elif source.startswith("rtsp://"):
+        asyncio.create_task(process_stream_task(source, is_webcam=False))
+    else:
+        raise HTTPException(status_code=400, detail="Invalid source. Use 'webcam:0' or 'rtsp://...'")
+
+    return {"status": "ok", "message": f"Stream started: {source}"}
+
+
+async def process_stream_task(source, is_webcam: bool = False):
+    """Background task for stream processing."""
+    global state
+
+    state.is_processing = True
+    state.frames_processed = 0
+    state.total_detections = 0
+
+    try:
+        # Open stream
+        if is_webcam:
+            cap = cv2.VideoCapture(source)
+        else:
+            cap = cv2.VideoCapture(source)
+
+        if not cap.isOpened():
+            await broadcast_message({
+                "type": "error",
+                "message": f"Failed to open stream: {source}",
+            })
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+        await broadcast_message({
+            "type": "stream_start",
+            "fps": fps,
+            "source": str(source),
+        })
+
+        frame_idx = 0
+        last_time = time.time()
+
+        while cap.isOpened() and state.is_processing:
+            ret, frame = cap.read()
+            if not ret:
+                await asyncio.sleep(0.01)
+                continue
+
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Process frame
+            result = await state.processor.process_single_image(
+                frame_rgb,
+                frame_id=f"stream_{frame_idx:06d}"
+            )
+
+            state.frames_processed = frame_idx + 1
+            state.total_detections += len(result.all_anomalies)
+
+            # Draw annotations
+            annotated = frame_rgb.copy()
+
+            for anomaly in result.all_anomalies:
+                if anomaly.mask is not None:
+                    annotated = draw_mask_overlay(annotated, anomaly.mask.data, color=(255, 0, 0), alpha=0.4)
+
+                cv2.rectangle(
+                    annotated,
+                    (anomaly.bbox.x_min, anomaly.bbox.y_min),
+                    (anomaly.bbox.x_max, anomaly.bbox.y_max),
+                    (255, 0, 0),
+                    2,
+                )
+                label = f"{anomaly.defect_type}: {anomaly.detection_confidence:.0%}"
+                cv2.putText(annotated, label, (anomaly.bbox.x_min, anomaly.bbox.y_min - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+            for struct in result.structures:
+                cv2.rectangle(
+                    annotated,
+                    (struct.bbox.x_min, struct.bbox.y_min),
+                    (struct.bbox.x_max, struct.bbox.y_max),
+                    (0, 255, 0),
+                    2,
+                )
+
+            # Calculate FPS
+            current_time = time.time()
+            actual_fps = 1.0 / (current_time - last_time) if (current_time - last_time) > 0 else 0
+            last_time = current_time
+
+            # Encode frame
+            annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+            _, buffer = cv2.imencode('.jpg', annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+            # Broadcast to clients
+            await broadcast_message({
+                "type": "frame",
+                "frame_index": frame_idx,
+                "image": f"data:image/jpeg;base64,{img_base64}",
+                "anomaly_count": len(result.all_anomalies),
+                "vlm_guided_count": len(result.vlm_guided_anomalies),
+                "timing_ms": result.total_time_ms,
+                "fps": round(actual_fps, 1),
+            })
+
+            frame_idx += 1
+
+            # Small delay to prevent overwhelming
+            await asyncio.sleep(0.001)
+
+        cap.release()
+
+        await broadcast_message({
+            "type": "stream_stop",
+            "frames_processed": state.frames_processed,
+            "total_detections": state.total_detections,
+        })
+
+    except Exception as e:
+        await broadcast_message({
+            "type": "error",
+            "message": str(e),
+        })
+
+    finally:
+        state.is_processing = False
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time updates."""
+    await websocket.accept()
+    active_connections.append(websocket)
+
+    try:
+        while True:
+            # Keep connection alive, handle any incoming messages
+            data = await websocket.receive_text()
+
+            # Handle ping/pong
+            if data == "ping":
+                await websocket.send_text("pong")
+
+    except WebSocketDisconnect:
+        if websocket in active_connections:
+            active_connections.remove(websocket)
+
+
+# Mount static files
+static_path = Path(__file__).parent / "static"
+if static_path.exists():
+    app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
+
+
+def run_server(host: str = "0.0.0.0", port: int = 8000):
+    """Run the server."""
+    import uvicorn
+    uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == "__main__":
+    run_server()
