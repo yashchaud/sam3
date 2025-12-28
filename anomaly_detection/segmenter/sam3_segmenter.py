@@ -111,6 +111,7 @@ class SAM3Segmenter:
         self._processor = None
         self._device = None
         self._current_image_shape: Optional[tuple[int, int]] = None
+        self._inference_state = None  # SAM3 inference state
 
     def load(self) -> None:
         """
@@ -141,7 +142,7 @@ class SAM3Segmenter:
     def _load_sam3(self) -> None:
         """Load SAM3 model from official repository."""
         from sam3.model_builder import build_sam3_image_model
-        from sam3.processor import Sam3Processor
+        from sam3.model.sam3_image_processor import Sam3Processor
 
         if not self.config.model_path.exists():
             raise RuntimeError(
@@ -175,15 +176,20 @@ class SAM3Segmenter:
         if image.ndim != 3:
             raise ValueError(f"Expected 3D image array, got shape {image.shape}")
 
+        from PIL import Image
+
         self._current_image_shape = (image.shape[0], image.shape[1])
-        self._processor.set_image(image)
+
+        # Convert numpy array to PIL Image (SAM3 expects PIL Image)
+        pil_image = Image.fromarray(image)
+
+        # set_image returns the inference state
+        self._inference_state = self._processor.set_image(pil_image)
 
     def clear_image(self) -> None:
         """Clear cached image embedding to free memory."""
         self._current_image_shape = None
-
-        if self._processor is not None:
-            self._processor.reset()
+        self._inference_state = None
 
     def segment_detection(
         self,
@@ -296,32 +302,41 @@ class SAM3Segmenter:
         Returns:
             Tuple of (binary mask, confidence score)
         """
-        # Format box for SAM3: [x_min, y_min, x_max, y_max]
-        box = [
-            detection.bbox.x_min,
-            detection.bbox.y_min,
-            detection.bbox.x_max,
-            detection.bbox.y_max,
-        ]
+        if self._inference_state is None:
+            raise RuntimeError("No image set. Call set_image() first.")
 
-        # Use text prompt if enabled (SAM3 feature)
+        # Use text prompt if enabled (SAM3 concept prompting feature)
         if self.config.use_text_prompts:
             # Use class name as concept prompt
             text_prompt = detection.class_name.replace("_", " ")
-            masks, scores = self._processor.predict(
-                box=box,
-                text_prompt=text_prompt,
-                multimask_output=self.config.max_masks_per_detection > 1,
+            output = self._processor.set_text_prompt(
+                state=self._inference_state,
+                prompt=text_prompt,
             )
         else:
-            # Box-only prompt
-            masks, scores = self._processor.predict(
+            # Box prompt: [x_min, y_min, x_max, y_max]
+            box = [
+                detection.bbox.x_min,
+                detection.bbox.y_min,
+                detection.bbox.x_max,
+                detection.bbox.y_max,
+            ]
+            output = self._processor.set_box_prompt(
+                state=self._inference_state,
                 box=box,
-                multimask_output=self.config.max_masks_per_detection > 1,
             )
 
+        # Extract results from output dict
+        masks = output.get("masks", [])
+        scores = output.get("scores", [])
+
+        if len(masks) == 0:
+            # Return empty mask if no predictions
+            empty_mask = np.zeros(self._current_image_shape, dtype=np.uint8)
+            return empty_mask, 0.0
+
         # Select best mask
-        if len(masks) > 1:
+        if len(masks) > 1 and len(scores) > 1:
             best_idx = np.argmax(scores)
             mask = masks[best_idx]
             score = float(scores[best_idx])
@@ -329,8 +344,18 @@ class SAM3Segmenter:
             mask = masks[0]
             score = float(scores[0]) if len(scores) > 0 else 0.0
 
+        # Convert to numpy if needed and ensure correct shape
+        if not isinstance(mask, np.ndarray):
+            import torch
+            if isinstance(mask, torch.Tensor):
+                mask = mask.cpu().numpy()
+
         # Convert to binary uint8
         binary_mask = (mask > self.config.mask_threshold).astype(np.uint8)
+
+        # Ensure 2D mask
+        if binary_mask.ndim == 3:
+            binary_mask = binary_mask.squeeze()
 
         return binary_mask, score
 

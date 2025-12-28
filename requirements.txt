@@ -23,6 +23,15 @@ huggingface_hub
 decord
 einops
 
+# API Server dependencies
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# RunPod (for serverless deployment)
+runpod>=1.6.0
+
 # ─────────────────────────────────────────────────────────────────
 # Detection: RF-DETR (Apache 2.0 License)
 # ─────────────────────────────────────────────────────────────────
