@@ -476,6 +476,8 @@ async def process_video_task(video_path: str):
     """Background task for video processing using SAM3 Video Tracker."""
     global state
 
+    logger.info(f"[VideoTask] Starting video processing for: {video_path}")
+
     state.is_processing = True
     state.frames_processed = 0
     state.total_detections = 0
@@ -483,10 +485,13 @@ async def process_video_task(video_path: str):
 
     try:
         # Get video metadata
+        logger.info(f"[VideoTask] Reading video metadata...")
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
+
+        logger.info(f"[VideoTask] Video metadata: {total_frames} frames @ {fps} FPS")
 
         await broadcast_message({
             "type": "video_start",
@@ -494,15 +499,26 @@ async def process_video_task(video_path: str):
             "total_frames": total_frames,
         })
 
+        logger.info(f"[VideoTask] Sent video_start message to clients")
+
         # Process video using processor.process_video() with video tracker
         # FrameSource already imported at top of file
 
         # Open video capture for reading frames to annotate
+        logger.info(f"[VideoTask] Opening video capture for annotation...")
         cap = cv2.VideoCapture(video_path)
 
+        logger.info(f"[VideoTask] Starting frame processing loop...")
+
         # Process video with video tracker - this yields FrameResult for each frame
+        frame_count = 0
         async for result in state.processor.process_video(source_path=video_path, source_type=FrameSource.FILE):
+            frame_count += 1
+            if frame_count == 1:
+                logger.info(f"[VideoTask] Received first frame result from processor!")
+
             if not state.is_processing:
+                logger.info(f"[VideoTask] Processing stopped by user at frame {result.frame_index}")
                 break
 
             state.frames_processed = result.frame_index + 1
@@ -513,7 +529,7 @@ async def process_video_task(video_path: str):
             ret, frame = cap.read()
 
             if not ret:
-                logger.warning(f"Failed to read frame {result.frame_index} for annotation")
+                logger.warning(f"[VideoTask] Failed to read frame {result.frame_index} for annotation")
                 continue
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -548,7 +564,7 @@ async def process_video_task(video_path: str):
             img_base64 = base64.b64encode(buffer).decode('utf-8')
 
             # Broadcast to clients IMMEDIATELY
-            await broadcast_message({
+            message = {
                 "type": "frame",
                 "frame_index": result.frame_index,
                 "image": f"data:image/jpeg;base64,{img_base64}",
@@ -556,18 +572,27 @@ async def process_video_task(video_path: str):
                 "vlm_judged_count": len(result.vlm_judged_anomalies),
                 "timing_ms": result.total_time_ms,
                 "progress": (result.frame_index + 1) / total_frames if total_frames > 0 else 0,
-            })
+            }
 
-            logger.info(f"Sent frame {result.frame_index}/{total_frames} with {len(result.all_anomalies)} anomalies")
+            if frame_count == 1:
+                logger.info(f"[VideoTask] Broadcasting first frame to {len(active_connections)} connected clients")
+
+            await broadcast_message(message)
+
+            if result.frame_index % 10 == 0:  # Log every 10th frame
+                logger.info(f"[VideoTask] Frame {result.frame_index}/{total_frames} - {len(result.all_anomalies)} anomalies - {result.total_time_ms:.0f}ms")
 
             # Small delay to prevent overwhelming clients
             await asyncio.sleep(0.001)
 
         cap.release()
 
+        logger.info(f"[VideoTask] Processing complete! Processed {frame_count} frames total")
+
         # Get final stats
         stats = state.processor.get_stats()
 
+        logger.info(f"[VideoTask] Broadcasting video_complete message...")
         await broadcast_message({
             "type": "video_complete",
             "frames_processed": state.frames_processed,
@@ -575,7 +600,13 @@ async def process_video_task(video_path: str):
             "avg_fps": stats.avg_fps,
         })
 
+        logger.info(f"[VideoTask] Video processing finished successfully!")
+
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Video processing failed: {e}")
+        logger.error(f"Full traceback:\n{error_details}")
         await broadcast_message({
             "type": "error",
             "message": str(e),
@@ -583,6 +614,7 @@ async def process_video_task(video_path: str):
 
     finally:
         state.is_processing = False
+        logger.info("Video processing task completed (or stopped)")
 
 
 @app.post("/api/stop")
