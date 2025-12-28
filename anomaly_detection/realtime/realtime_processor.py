@@ -19,6 +19,7 @@ from ..segmenter import SAM3Segmenter, SegmenterConfig
 from ..models import Detection, AnomalyResult, PipelineOutput, BoundingBox, SegmentationMask
 from ..geometry import MaskGeometryExtractor
 from ..config import DEFAULT_ANOMALY_CLASSES
+from ..debug_output import DebugOutputManager
 
 # Setup logger for VLM predictions
 logger = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ class RealtimeVideoProcessor:
     - Image sequences
     """
 
-    def __init__(self, config: RealtimeConfig):
+    def __init__(self, config: RealtimeConfig, debug_output_dir: str | Path | None = None):
         self.config = config
 
         # Initialize components (SAM3 + VLM Judge only, no RF-DETR)
@@ -122,6 +123,12 @@ class RealtimeVideoProcessor:
 
         # Result callbacks
         self._on_result_callback: Callable[[FrameResult], None] | None = None
+
+        # Debug output
+        self._debug = DebugOutputManager(
+            output_dir=debug_output_dir or "output/debug",
+            enabled=debug_output_dir is not None
+        )
 
     def load(self) -> None:
         """Load all models into memory."""
@@ -265,6 +272,9 @@ class RealtimeVideoProcessor:
             timestamp=frame.timestamp,
         )
 
+        # Debug: Save original frame
+        self._debug.save_original_frame(frame.frame_id, frame.frame_index, frame.image)
+
         # STEP 1: Run SAM3 on ALL default anomaly classes (Title Case - first letter caps)
         seg_start = time.perf_counter()
         anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]  # Convert to Title Case
@@ -281,6 +291,15 @@ class RealtimeVideoProcessor:
 
         logger.info(f"[Frame {frame.frame_index}] SAM3 generated {len(sam_candidates)} candidate masks")
 
+        # Debug: Save SAM3 summary
+        self._debug.save_sam3_summary(
+            frame.frame_id,
+            frame.frame_index,
+            len(sam_candidates),
+            [c.defect_type for c in sam_candidates],
+            result.segmentation_time_ms
+        )
+
         # Store candidates for this frame
         self._pending_sam_candidates[frame.frame_id] = sam_candidates
 
@@ -289,6 +308,14 @@ class RealtimeVideoProcessor:
 
         if self._vlm_judge.should_process_frame(frame.frame_index):
             logger.info(f"[Frame {frame.frame_index}] Submitting frame to VLM judge (will judge {len(sam_candidates)} SAM3 candidates)")
+
+            # Generate grid overlay for debug output
+            self._vlm_judge.grid.compute_grid(frame.image.shape[1], frame.image.shape[0])
+            grid_image = self._vlm_judge.grid.draw_grid(frame.image)
+
+            # Debug: Save VLM grid overlay
+            self._debug.save_vlm_grid(frame.frame_id, frame.frame_index, grid_image)
+
             await self._vlm_judge.submit_frame_async(
                 frame.image,
                 frame.frame_id,
@@ -303,6 +330,15 @@ class RealtimeVideoProcessor:
         for response in ready_judgments:
             result.vlm_response = response
             self._stats.total_vlm_predictions += len(response.predictions)
+
+            # Debug: Save VLM response
+            self._debug.save_vlm_response(
+                response.frame_id,
+                frame.frame_index,
+                response.predictions,
+                response.generation_time_ms,
+                response.request_frame_index
+            )
 
             # Log VLM judgments
             if response.predictions:
@@ -319,18 +355,40 @@ class RealtimeVideoProcessor:
 
             # STEP 4: Filter SAM3 candidates by VLM judgment
             if response.frame_id in self._pending_sam_candidates:
+                sam_candidates_for_frame = self._pending_sam_candidates[response.frame_id]
+
                 approved_anomalies = self._filter_by_vlm_judgment(
-                    self._pending_sam_candidates[response.frame_id],
+                    sam_candidates_for_frame,
                     response.predictions,
                     response.frame_id,
                 )
                 result.vlm_judged_anomalies.extend(approved_anomalies)
+
+                # Debug: Save approved detections
+                self._debug.save_approved_detections(
+                    response.frame_id,
+                    frame.frame_index,
+                    frame.image,
+                    approved_anomalies,
+                    len(sam_candidates_for_frame)
+                )
 
                 # Clean up processed candidates
                 del self._pending_sam_candidates[response.frame_id]
 
         result.vlm_time_ms = (time.perf_counter() - vlm_start) * 1000
         result.total_time_ms = (time.perf_counter() - start_time) * 1000
+
+        # Debug: Save frame timing
+        self._debug.save_frame_timing(
+            frame.frame_id,
+            frame.frame_index,
+            result.segmentation_time_ms,
+            result.vlm_time_ms,
+            result.total_time_ms,
+            result.sam_candidate_count,
+            len(result.vlm_judged_anomalies)
+        )
 
         return result
 
@@ -381,6 +439,16 @@ class RealtimeVideoProcessor:
                         )
                         candidates.append(candidate)
                         logger.debug(f"  SAM3 found {defect_type}: bbox={bbox}")
+
+                        # Debug: Save SAM3 candidate
+                        self._debug.save_sam3_candidate(
+                            frame_id,
+                            int(frame_id.split('_')[-1]) if '_' in frame_id else 0,
+                            defect_type,
+                            result.mask.data,
+                            image,
+                            candidate.confidence
+                        )
 
         finally:
             self._segmenter.clear_image()

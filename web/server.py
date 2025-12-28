@@ -330,7 +330,7 @@ async def process_image(file: UploadFile = File(...)):
                     {"class_name": s.class_name, "confidence": s.confidence, "bbox": s.bbox.to_xyxy()}
                     for s in result.structures
                 ],
-                "vlm_guided_count": len(result.vlm_guided_anomalies),
+                "vlm_judged_count": len(result.vlm_judged_anomalies),
                 "timing_ms": result.total_time_ms,
             }
         }
@@ -447,7 +447,7 @@ async def process_video_task(video_path: str):
                 "frame_index": frame_idx,
                 "image": f"data:image/jpeg;base64,{img_base64}",
                 "anomaly_count": len(result.all_anomalies),
-                "vlm_guided_count": len(result.vlm_guided_anomalies),
+                "vlm_judged_count": len(result.vlm_judged_anomalies),
                 "timing_ms": result.total_time_ms,
                 "progress": (frame_idx + 1) / total_frames,
             })
@@ -611,7 +611,7 @@ async def process_stream_task(source, is_webcam: bool = False):
                 "frame_index": frame_idx,
                 "image": f"data:image/jpeg;base64,{img_base64}",
                 "anomaly_count": len(result.all_anomalies),
-                "vlm_guided_count": len(result.vlm_guided_anomalies),
+                "vlm_judged_count": len(result.vlm_judged_anomalies),
                 "timing_ms": result.total_time_ms,
                 "fps": round(actual_fps, 1),
             })

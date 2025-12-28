@@ -45,6 +45,7 @@ def parse_args():
 
     # Output
     parser.add_argument("--output-dir", type=str, default=None, help="Save annotated frames")
+    parser.add_argument("--debug-output", type=str, default=None, help="Enable debug output (saves all pipeline stages)")
 
     return parser.parse_args()
 
@@ -96,8 +97,10 @@ async def main():
     # Process video
     print(f"Processing: {source_path or f'webcam:{webcam_id}'}")
     print(f"VLM enabled: {args.enable_vlm}")
+    if args.debug_output:
+        print(f"Debug output: {args.debug_output}")
 
-    async with RealtimeVideoProcessor(config) as processor:
+    async with RealtimeVideoProcessor(config, debug_output_dir=args.debug_output) as processor:
         frame_count = 0
 
         async for result in processor.process_video():
@@ -105,7 +108,7 @@ async def main():
 
             # Print progress
             anomaly_count = len(result.all_anomalies)
-            vlm_count = len(result.vlm_guided_anomalies)
+            vlm_count = len(result.vlm_judged_anomalies)
 
             print(
                 f"\rFrame {result.frame_index}: "

@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--output", type=str, default="output.jpg")
     parser.add_argument("--json-output", type=str, default=None)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--debug-output", type=str, default=None, help="Enable debug output (saves all pipeline stages)")
 
     return parser.parse_args()
 
@@ -58,14 +59,17 @@ async def main():
 
     # Process
     print("Processing...")
-    async with RealtimeVideoProcessor(config) as processor:
+    if args.debug_output:
+        print(f"Debug output: {args.debug_output}")
+
+    async with RealtimeVideoProcessor(config, debug_output_dir=args.debug_output) as processor:
         result = await processor.process_single_image(image, frame_id="single_image")
 
     # Report results
     print(f"\nResults:")
     print(f"  Structures found: {len(result.structures)}")
     print(f"  Anomalies found: {len(result.anomalies)}")
-    print(f"  VLM-guided anomalies: {len(result.vlm_guided_anomalies)}")
+    print(f"  VLM-judged anomalies: {len(result.vlm_judged_anomalies)}")
     print(f"  Processing time: {result.total_time_ms:.1f}ms")
 
     for anomaly in result.all_anomalies:
