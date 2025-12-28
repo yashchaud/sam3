@@ -537,7 +537,6 @@ class SAM3Segmenter:
                     images=images,
                     text=text_prompts,
                     return_tensors="pt",
-                    padding=True,
                 ).to(self._device)
 
                 # Single forward pass for ALL prompts
@@ -781,7 +780,6 @@ class SAM3Segmenter:
                         images=chunk_images,
                         text=chunk_texts,
                         return_tensors="pt",
-                        padding=True,
                     ).to(self._device)
 
                     with torch.no_grad():
