@@ -287,13 +287,12 @@ class RealtimeVideoProcessor:
         # STEP 2: Submit to VLM for judging (async) - every N frames
         vlm_start = time.perf_counter()
 
-        if self._vlm_judge.should_process_frame(frame.frame_index) and sam_candidates:
-            logger.info(f"[Frame {frame.frame_index}] Submitting {len(sam_candidates)} SAM3 candidates to VLM judge")
+        if self._vlm_judge.should_process_frame(frame.frame_index):
+            logger.info(f"[Frame {frame.frame_index}] Submitting frame to VLM judge (will judge {len(sam_candidates)} SAM3 candidates)")
             await self._vlm_judge.submit_frame_async(
                 frame.image,
                 frame.frame_id,
                 frame.frame_index,
-                candidates=sam_candidates,  # Pass SAM3 candidates for judging
             )
 
         # STEP 3: Check for ready VLM judgments from previous frames
