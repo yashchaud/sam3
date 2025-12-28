@@ -1,4 +1,4 @@
-"""Real-time video processor with VLM-guided segmentation."""
+"""Real-time video processor with SAM3-first pipeline + VLM judging."""
 
 import asyncio
 import time
@@ -18,9 +18,19 @@ from ..vlm import VLMJudge, VLMConfig, VLMResponse, VLMPrediction, PredictionTyp
 from ..segmenter import SAM3Segmenter, SegmenterConfig
 from ..models import Detection, AnomalyResult, PipelineOutput, BoundingBox, SegmentationMask
 from ..geometry import MaskGeometryExtractor
+from ..config import DEFAULT_ANOMALY_CLASSES
 
 # Setup logger for VLM predictions
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SAMCandidate:
+    """Candidate segmentation from SAM3."""
+    defect_type: str
+    mask: np.ndarray
+    bbox: BoundingBox
+    confidence: float = 0.5
 
 
 @dataclass
@@ -34,9 +44,12 @@ class FrameResult:
     anomalies: list[AnomalyResult] = field(default_factory=list)
     structures: list[Detection] = field(default_factory=list)
 
-    # VLM-guided additions
-    vlm_guided_anomalies: list[AnomalyResult] = field(default_factory=list)
+    # VLM-judged anomalies (SAM3 candidates that passed VLM filtering)
+    vlm_judged_anomalies: list[AnomalyResult] = field(default_factory=list)
     vlm_response: VLMResponse | None = None
+
+    # SAM3 candidate count
+    sam_candidate_count: int = 0
 
     # Timing
     detection_time_ms: float = 0.0
@@ -46,7 +59,7 @@ class FrameResult:
 
     @property
     def all_anomalies(self) -> list[AnomalyResult]:
-        return self.anomalies + self.vlm_guided_anomalies
+        return self.anomalies + self.vlm_judged_anomalies
 
     def to_dict(self) -> dict:
         return {
@@ -55,7 +68,8 @@ class FrameResult:
             "timestamp": self.timestamp,
             "anomaly_count": len(self.all_anomalies),
             "structure_count": len(self.structures),
-            "vlm_guided_count": len(self.vlm_guided_anomalies),
+            "sam_candidates": self.sam_candidate_count,
+            "vlm_judged_count": len(self.vlm_judged_anomalies),
             "timing": {
                 "detection_ms": round(self.detection_time_ms, 2),
                 "segmentation_ms": round(self.segmentation_time_ms, 2),
@@ -67,20 +81,19 @@ class FrameResult:
 
 class RealtimeVideoProcessor:
     """
-    Real-time video processor with VLM-guided anomaly detection.
+    Real-time video processor with SAM3-first pipeline + VLM judging.
 
     Pipeline:
-    1. Stream frames from video/webcam/RTSP
-    2. Every N frames, send to VLM (OpenRouter) for anomaly detection
-    3. VLM outputs structured coordinates for detected defects
-    4. Run SAM3 segmentation on VLM-predicted coordinates
-    5. Stale VLM predictions (>60 frames old) are discarded
+    1. SAM3 segments ALL default anomaly classes (CRACK, CORROSION, etc.) as text prompts
+    2. Submit SAM3 candidates to VLM for judging (async)
+    3. VLM judges which candidates are real anomalies
+    4. Only keep VLM-approved detections
     """
 
     def __init__(self, config: RealtimeConfig):
         self.config = config
 
-        # Initialize components (VLM + SAM3 only, no RF-DETR)
+        # Initialize components (SAM3 + VLM Judge only, no RF-DETR)
         self._segmenter: SAM3Segmenter | None = None
         self._vlm_judge: VLMJudge | None = None
         self._geometry = MaskGeometryExtractor()
@@ -98,8 +111,8 @@ class RealtimeVideoProcessor:
         self._stats = ProcessingStats()
         self._processing_times: deque[float] = deque(maxlen=100)
 
-        # VLM pending predictions
-        self._pending_vlm_predictions: list[VLMPrediction] = []
+        # Pending SAM candidates awaiting VLM judgment (frame_id -> candidates)
+        self._pending_sam_candidates: dict[str, list[SAMCandidate]] = {}
 
         # Result callbacks
         self._on_result_callback: Callable[[FrameResult], None] | None = None
@@ -228,7 +241,15 @@ class RealtimeVideoProcessor:
         return result
 
     async def _process_frame(self, frame: BufferedFrame) -> FrameResult:
-        """Process a single buffered frame using VLM + SAM3 pipeline."""
+        """
+        Process a single buffered frame using SAM3-first pipeline.
+
+        Pipeline:
+        1. SAM3 segments ALL default anomaly classes (in CAPS as text prompts)
+        2. Submit SAM3 candidates to VLM for judging (async)
+        3. Check for ready VLM judgments from previous frames
+        4. Only keep VLM-approved detections
+        """
         start_time = time.perf_counter()
 
         # Initialize result
@@ -238,174 +259,200 @@ class RealtimeVideoProcessor:
             timestamp=frame.timestamp,
         )
 
-        # Step 1: Check for ready VLM predictions and process them
+        # STEP 1: Run SAM3 on ALL default anomaly classes (in CAPS)
+        seg_start = time.perf_counter()
+        anomaly_classes = [cls.upper() for cls in DEFAULT_ANOMALY_CLASSES]  # Convert to CAPS
+
+        logger.info(f"[Frame {frame.frame_index}] Running SAM3 on {len(anomaly_classes)} anomaly classes: {', '.join(anomaly_classes)}")
+
+        sam_candidates = await self._segment_all_anomaly_classes(
+            frame.image,
+            frame.frame_id,
+            anomaly_classes
+        )
+        result.segmentation_time_ms = (time.perf_counter() - seg_start) * 1000
+        result.sam_candidate_count = len(sam_candidates)
+
+        logger.info(f"[Frame {frame.frame_index}] SAM3 generated {len(sam_candidates)} candidate masks")
+
+        # Store candidates for this frame
+        self._pending_sam_candidates[frame.frame_id] = sam_candidates
+
+        # STEP 2: Submit to VLM for judging (async) - every N frames
         vlm_start = time.perf_counter()
 
-        # Get any ready VLM predictions from previous async requests
-        ready_predictions = await self._vlm_judge.get_ready_predictions(
-            frame.frame_index
-        )
-
-        for response in ready_predictions:
-            result.vlm_response = response
-            self._stats.total_vlm_predictions += len(response.predictions)
-
-            # Log VLM predictions
-            if response.predictions:
-                logger.info(
-                    f"[Frame {frame.frame_index}] VLM returned {len(response.predictions)} predictions "
-                    f"(latency: {response.generation_time_ms:.0f}ms)"
-                )
-                for pred in response.predictions:
-                    if pred.box:
-                        logger.info(
-                            f"  -> Defect: {pred.defect_type}, confidence: {pred.confidence:.2f}, "
-                            f"box: [{pred.box[0]}, {pred.box[1]}, {pred.box[2]}, {pred.box[3]}]"
-                        )
-                    elif pred.point:
-                        logger.info(
-                            f"  -> Defect: {pred.defect_type}, confidence: {pred.confidence:.2f}, "
-                            f"point: ({pred.point[0]}, {pred.point[1]})"
-                        )
-                    elif pred.grid_cell:
-                        logger.info(
-                            f"  -> Defect: {pred.defect_type}, confidence: {pred.confidence:.2f}, "
-                            f"grid_cell: {pred.grid_cell}"
-                        )
-
-            # Step 2: Run SAM3 segmentation on VLM predictions
-            seg_start = time.perf_counter()
-            vlm_anomalies = await self._process_vlm_predictions(
-                frame.image,
-                response.predictions,
-                frame.frame_id,
-            )
-            result.segmentation_time_ms = (time.perf_counter() - seg_start) * 1000
-            result.vlm_guided_anomalies.extend(vlm_anomalies)
-
-        # Submit new frame for VLM processing if appropriate
-        if self._vlm_judge.should_process_frame(frame.frame_index):
-            logger.debug(f"[Frame {frame.frame_index}] Submitting frame to VLM for analysis")
+        if self._vlm_judge.should_process_frame(frame.frame_index) and sam_candidates:
+            logger.info(f"[Frame {frame.frame_index}] Submitting {len(sam_candidates)} SAM3 candidates to VLM judge")
             await self._vlm_judge.submit_frame_async(
                 frame.image,
                 frame.frame_id,
                 frame.frame_index,
+                candidates=sam_candidates,  # Pass SAM3 candidates for judging
             )
+
+        # STEP 3: Check for ready VLM judgments from previous frames
+        ready_judgments = await self._vlm_judge.get_ready_predictions(
+            frame.frame_index
+        )
+
+        for response in ready_judgments:
+            result.vlm_response = response
+            self._stats.total_vlm_predictions += len(response.predictions)
+
+            # Log VLM judgments
+            if response.predictions:
+                approved_count = sum(1 for p in response.predictions if p.confidence >= self.config.confidence_threshold)
+                logger.info(
+                    f"[Frame {response.frame_id}] VLM JUDGE: approved {approved_count}/{len(response.predictions)} "
+                    f"SAM3 candidates (latency: {response.generation_time_ms:.0f}ms)"
+                )
+                for pred in response.predictions:
+                    verdict = "✓ APPROVED" if pred.confidence >= self.config.confidence_threshold else "✗ REJECTED"
+                    logger.info(
+                        f"  {verdict}: {pred.defect_type.upper()}, confidence: {pred.confidence:.2f}"
+                    )
+
+            # STEP 4: Filter SAM3 candidates by VLM judgment
+            if response.frame_id in self._pending_sam_candidates:
+                approved_anomalies = self._filter_by_vlm_judgment(
+                    self._pending_sam_candidates[response.frame_id],
+                    response.predictions,
+                    response.frame_id,
+                )
+                result.vlm_judged_anomalies.extend(approved_anomalies)
+
+                # Clean up processed candidates
+                del self._pending_sam_candidates[response.frame_id]
 
         result.vlm_time_ms = (time.perf_counter() - vlm_start) * 1000
         result.total_time_ms = (time.perf_counter() - start_time) * 1000
 
         return result
 
-    async def _process_vlm_predictions(
+    async def _segment_all_anomaly_classes(
         self,
         image: np.ndarray,
-        predictions: list[VLMPrediction],
         frame_id: str,
-    ) -> list[AnomalyResult]:
-        """Process VLM predictions and run segmentation."""
-        if not predictions:
-            return []
+        anomaly_classes: list[str],
+    ) -> list[SAMCandidate]:
+        """
+        Segment image using ALL anomaly classes as text prompts for SAM3.
 
-        results = []
+        Args:
+            image: RGB image
+            frame_id: Frame identifier
+            anomaly_classes: List of defect types in CAPS (CRACK, CORROSION, etc.)
+
+        Returns:
+            List of SAM candidate masks
+        """
+        candidates = []
         self._segmenter.set_image(image)
 
         try:
-            for pred in predictions:
-                # Create detection-like prompt for SAM
-                if pred.prediction_type == PredictionType.BOX and pred.box:
-                    # Use box prompt
-                    bbox = BoundingBox(*pred.box)
-                    mask_data = self._segment_with_box(bbox)
-                elif pred.prediction_type == PredictionType.POINT and pred.point:
-                    # Use point prompt
-                    mask_data = self._segment_with_point(pred.point)
-                else:
-                    continue
-
-                if mask_data is None:
-                    continue
-
-                # Extract geometry
-                geometry = self._geometry.extract(mask_data)
-
-                # Build anomaly result
-                x_min = int(pred.box[0]) if pred.box else pred.point[0] - 50
-                y_min = int(pred.box[1]) if pred.box else pred.point[1] - 50
-                x_max = int(pred.box[2]) if pred.box else pred.point[0] + 50
-                y_max = int(pred.box[3]) if pred.box else pred.point[1] + 50
-
-                anomaly = AnomalyResult(
-                    anomaly_id=f"vlm_{frame_id}_{len(results)}",
-                    frame_id=frame_id,
-                    timestamp=time.time(),
-                    defect_type=pred.defect_type,
-                    structure_type=None,
-                    bbox=BoundingBox(x_min, y_min, x_max, y_max),
-                    mask=SegmentationMask(data=mask_data),
-                    geometry=geometry,
-                    detection_confidence=pred.confidence,
-                    segmentation_confidence=0.8,  # VLM-guided
-                    association_confidence=0.0,
+            for defect_type in anomaly_classes:
+                # Create fake detection with defect type as text prompt
+                fake_detection = Detection(
+                    detection_id=f"{frame_id}_{defect_type}",
+                    detection_type=Detection,
+                    class_name=defect_type,  # SAM3 uses this as text prompt
+                    confidence=1.0,
+                    bbox=BoundingBox(0, 0, image.shape[1], image.shape[0]),  # Full image
                 )
-                results.append(anomaly)
+
+                # Run SAM3 segmentation
+                result = self._segmenter.segment_detection(fake_detection, image=None)
+
+                if result.success and result.mask and result.mask.data is not None:
+                    # Extract bounding box from mask
+                    bbox = self._extract_bbox_from_mask(result.mask.data)
+
+                    if bbox:
+                        candidate = SAMCandidate(
+                            defect_type=defect_type,
+                            mask=result.mask.data,
+                            bbox=bbox,
+                            confidence=result.mask.sam_score if hasattr(result.mask, 'sam_score') else 0.5,
+                        )
+                        candidates.append(candidate)
+                        logger.debug(f"  SAM3 found {defect_type}: bbox={bbox}")
 
         finally:
             self._segmenter.clear_image()
 
-        return results
+        return candidates
 
-    def _segment_with_box(self, bbox: BoundingBox) -> np.ndarray | None:
-        """Run SAM segmentation with box prompt."""
-        try:
-            # Create fake detection for segmentation
-            fake_detection = Detection(
-                detection_id="vlm_box",
-                detection_type=Detection,  # Will be ignored
-                class_name="vlm_prediction",
-                confidence=0.9,
-                bbox=bbox,
-            )
-            result = self._segmenter.segment_detection(fake_detection)
-            if result.success and result.mask:
-                return result.mask.data
-        except Exception:
-            pass
-        return None
+    def _extract_bbox_from_mask(self, mask: np.ndarray) -> BoundingBox | None:
+        """Extract bounding box from binary mask."""
+        import cv2
 
-    def _segment_with_point(self, point: tuple[int, int]) -> np.ndarray | None:
-        """Run SAM segmentation with point prompt."""
-        try:
-            # Use SAM's point prompting
-            import torch
+        if mask is None or mask.sum() == 0:
+            return None
 
-            if not hasattr(self._segmenter, '_model') or self._segmenter._model is None:
-                return None
+        # Find contours
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            input_points = torch.tensor([[[point[0], point[1]]]], dtype=torch.float32)
-            input_labels = torch.tensor([[[1]]], dtype=torch.int32)
+        if not contours:
+            return None
 
-            if self._segmenter._device == "cuda":
-                input_points = input_points.cuda()
-                input_labels = input_labels.cuda()
+        # Get bounding box from largest contour
+        largest_contour = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest_contour)
 
-            # Run prediction
-            with torch.no_grad():
-                masks, scores, _ = self._segmenter._model.predict(
-                    input_points=input_points,
-                    input_labels=input_labels,
-                    multimask_output=True,
+        return BoundingBox(x, y, x + w, y + h)
+
+    def _filter_by_vlm_judgment(
+        self,
+        sam_candidates: list[SAMCandidate],
+        vlm_predictions: list[VLMPrediction],
+        frame_id: str,
+    ) -> list[AnomalyResult]:
+        """
+        Filter SAM3 candidates by VLM judgment.
+
+        Args:
+            sam_candidates: SAM3-generated candidate masks
+            vlm_predictions: VLM judgment predictions
+            frame_id: Frame identifier
+
+        Returns:
+            List of approved anomaly results
+        """
+        approved = []
+
+        # Match VLM predictions to SAM candidates by defect type
+        for vlm_pred in vlm_predictions:
+            if vlm_pred.confidence < self.config.confidence_threshold:
+                continue  # VLM rejected this candidate
+
+            # Find matching SAM candidate
+            matching_candidate = None
+            for candidate in sam_candidates:
+                if candidate.defect_type.lower() == vlm_pred.defect_type.lower():
+                    matching_candidate = candidate
+                    break
+
+            if matching_candidate:
+                # Extract geometry
+                geometry = self._geometry.extract(matching_candidate.mask)
+
+                # Build approved anomaly result
+                anomaly = AnomalyResult(
+                    anomaly_id=f"vlm_approved_{frame_id}_{vlm_pred.defect_type}",
+                    frame_id=frame_id,
+                    timestamp=time.time(),
+                    defect_type=vlm_pred.defect_type,
+                    structure_type=None,
+                    bbox=matching_candidate.bbox,
+                    mask=SegmentationMask(data=matching_candidate.mask),
+                    geometry=geometry,
+                    detection_confidence=vlm_pred.confidence,  # VLM confidence
+                    segmentation_confidence=matching_candidate.confidence,  # SAM3 confidence
+                    association_confidence=1.0,  # Perfect match by defect type
                 )
+                approved.append(anomaly)
 
-            # Select best mask
-            best_idx = scores.argmax().item()
-            mask = masks[0, best_idx].cpu().numpy()
-
-            return (mask > 0.5).astype(np.uint8)
-
-        except Exception:
-            pass
-        return None
+        return approved
 
     def stop(self) -> None:
         """Stop processing."""
