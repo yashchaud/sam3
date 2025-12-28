@@ -88,12 +88,14 @@ class OpenRouterClient(BaseVLMClient):
             )
 
         start_time = time.perf_counter()
+        logger.info(f"[OpenRouter] Starting API call for frame {frame_id}")
 
         try:
             session = await self._ensure_session()
 
             # Convert image to base64
             image_b64 = self._image_to_base64(grid_image)
+            logger.info(f"[OpenRouter] Image encoded, size: {len(image_b64)} bytes")
 
             # Build request
             headers = {
@@ -130,6 +132,9 @@ class OpenRouterClient(BaseVLMClient):
                 "temperature": 0,
             }
 
+            logger.info(f"[OpenRouter] Sending request to {self.config.openrouter_base_url}/chat/completions")
+            logger.info(f"[OpenRouter] Model: {self.config.openrouter_model}")
+
             async with session.post(
                 f"{self.config.openrouter_base_url}/chat/completions",
                 headers=headers,
@@ -137,9 +142,11 @@ class OpenRouterClient(BaseVLMClient):
                 timeout=aiohttp.ClientTimeout(total=self.config.timeout_seconds),
             ) as response:
                 generation_time_ms = (time.perf_counter() - start_time) * 1000
+                logger.info(f"[OpenRouter] Response status: {response.status}, latency: {generation_time_ms:.0f}ms")
 
                 if response.status != 200:
                     error_text = await response.text()
+                    logger.error(f"[OpenRouter] API error: {error_text[:500]}")
                     return VLMResponse(
                         frame_id=frame_id,
                         predictions=[],
