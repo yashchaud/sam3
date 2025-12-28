@@ -45,9 +45,7 @@ active_connections: list[WebSocket] = []
 
 class ConfigRequest(BaseModel):
     sam_model_path: str
-    detector_weights: Optional[str] = None
-    enable_vlm: bool = False
-    vlm_provider: str = "local"
+    vlm_provider: str = "openrouter"
     openrouter_api_key: Optional[str] = None
     vlm_every_n_frames: int = 10
     confidence_threshold: float = 0.3
