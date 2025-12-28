@@ -512,7 +512,7 @@ async def process_video_task(video_path: str):
 
         # Process video with video tracker - this yields FrameResult for each frame
         frame_count = 0
-        async for result in state.processor.process_video(source_path=video_path, source_type=FrameSource.FILE):
+        async for result in state.processor.process_video(source_path=video_path, source_type=FrameSource.VIDEO_FILE):
             frame_count += 1
             if frame_count == 1:
                 logger.info(f"[VideoTask] Received first frame result from processor!")
