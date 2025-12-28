@@ -6,6 +6,8 @@ from .image_utils import (
     ensure_rgb,
     resize_for_inference,
     validate_image,
+    draw_detections,
+    draw_mask_overlay,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     "ensure_rgb",
     "resize_for_inference",
     "validate_image",
+    "draw_detections",
+    "draw_mask_overlay",
 ]
