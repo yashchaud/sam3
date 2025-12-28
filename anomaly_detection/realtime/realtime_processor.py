@@ -261,12 +261,15 @@ class RealtimeVideoProcessor:
 
     async def _process_single_image_sync(self, frame: BufferedFrame) -> FrameResult:
         """
-        Process a single image with VLM-first pipeline.
+        Process a single image with parallel SAM3 + VLM pipeline.
 
-        Flow:
-        1. VLM analyzes image first → gets predictions with bounding boxes
-        2. SAM3 segments each VLM prediction using box prompts
-        3. Results combined with proper confidence scores
+        Flow (parallel):
+        1. SAM3 Global: Text prompts for all defect classes on full image
+        2. SAM3 Per-Tile: Text prompts on each grid tile (catches small defects)
+        3. VLM: Analyzes grid-overlay image → returns cell predictions
+        4. SAM3 Point: For each VLM prediction, segment with point prompt
+
+        Then union all masks with IoU-based deduplication.
         """
         start_time = time.perf_counter()
 
@@ -280,35 +283,66 @@ class RealtimeVideoProcessor:
         # Debug: Save original frame
         self._debug.save_original_frame(frame.frame_id, frame.frame_index, frame.image)
 
-        # STEP 1: Call VLM first to detect defects with bounding boxes
-        vlm_start = time.perf_counter()
+        # Get defect classes for SAM3 text prompts
+        anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]
+        logger.info(f"[Frame {frame.frame_index}] Starting parallel pipeline with {len(anomaly_classes)} defect classes")
 
-        logger.info(f"[Frame {frame.frame_index}] Calling VLM to detect defects...")
-
-        # Generate grid overlay
+        # Generate grid overlay for VLM (but SAM3 uses original image!)
         self._vlm_judge.grid.compute_grid(frame.image.shape[1], frame.image.shape[0])
         grid_image = self._vlm_judge.grid.draw_grid(frame.image)
-
-        # Debug: Save VLM grid overlay
         self._debug.save_vlm_grid(frame.frame_id, frame.frame_index, grid_image)
 
-        # Call VLM synchronously
+        # ========================================
+        # PARALLEL STEP 1: SAM3 Global Text Prompts
+        # ========================================
+        sam_global_start = time.perf_counter()
+        logger.info(f"[Frame {frame.frame_index}] SAM3 Global: Running {len(anomaly_classes)} text prompts on full image...")
+
+        global_results = self._segmenter.segment_with_text_batch(
+            frame.image,  # Original image, no grid!
+            anomaly_classes,
+            prefix=f"{frame.frame_id}_global"
+        )
+        sam_global_time = (time.perf_counter() - sam_global_start) * 1000
+        logger.info(f"[Frame {frame.frame_index}] SAM3 Global: Found {len(global_results)} masks in {sam_global_time:.0f}ms")
+
+        # ========================================
+        # PARALLEL STEP 2: SAM3 Per-Tile Text Prompts
+        # ========================================
+        sam_tile_start = time.perf_counter()
+        grid_config = self._vlm_judge.grid.config
+        logger.info(f"[Frame {frame.frame_index}] SAM3 Tiles: Running on {grid_config.cols}x{grid_config.rows} grid...")
+
+        tile_results = self._segmenter.segment_tiles_with_text(
+            frame.image,  # Original image, no grid!
+            anomaly_classes,
+            grid_cols=grid_config.cols,
+            grid_rows=grid_config.rows,
+            prefix=f"{frame.frame_id}_tile"
+        )
+        sam_tile_time = (time.perf_counter() - sam_tile_start) * 1000
+        logger.info(f"[Frame {frame.frame_index}] SAM3 Tiles: Found {len(tile_results)} masks in {sam_tile_time:.0f}ms")
+
+        # ========================================
+        # PARALLEL STEP 3: VLM Analysis
+        # ========================================
+        vlm_start = time.perf_counter()
+        logger.info(f"[Frame {frame.frame_index}] VLM: Analyzing image for defects...")
+
         vlm_response = await self._vlm_judge.process_frame(
             frame.image,
             frame.frame_id,
             frame.frame_index,
         )
-
         result.vlm_time_ms = (time.perf_counter() - vlm_start) * 1000
 
         if vlm_response:
             result.vlm_response = vlm_response
-            logger.info(f"[Frame {frame.frame_index}] VLM response: {len(vlm_response.predictions)} predictions, valid={vlm_response.is_valid}")
+            logger.info(f"[Frame {frame.frame_index}] VLM: {len(vlm_response.predictions)} predictions in {result.vlm_time_ms:.0f}ms")
 
             if vlm_response.error_message:
                 logger.warning(f"[Frame {frame.frame_index}] VLM error: {vlm_response.error_message}")
 
-            # Debug: Save VLM response
             self._debug.save_vlm_response(
                 frame.frame_id,
                 frame.frame_index,
@@ -317,91 +351,133 @@ class RealtimeVideoProcessor:
                 frame.frame_index
             )
 
-        # STEP 2: Run SAM3 segmentation for each VLM prediction using box prompts
-        seg_start = time.perf_counter()
-
+        # ========================================
+        # STEP 4: SAM3 Point Prompts from VLM predictions
+        # ========================================
+        vlm_point_results = []
         if vlm_response and vlm_response.predictions:
-            logger.info(f"[Frame {frame.frame_index}] Running SAM3 on {len(vlm_response.predictions)} VLM predictions...")
+            sam_point_start = time.perf_counter()
+            logger.info(f"[Frame {frame.frame_index}] SAM3 Points: Segmenting {len(vlm_response.predictions)} VLM predictions...")
 
             for i, pred in enumerate(vlm_response.predictions):
                 if pred.confidence < self.config.confidence_threshold:
-                    logger.info(f"[Frame {frame.frame_index}] Skipping prediction {i}: confidence {pred.confidence:.2f} < threshold {self.config.confidence_threshold}")
                     continue
 
-                # Get bounding box - either from pred.box directly or by resolving grid_cell
-                box_xyxy = None
-
-                if pred.box:
-                    # VLM returned pixel coordinates directly
-                    box_xyxy = list(pred.box)
-                    logger.info(f"[Frame {frame.frame_index}] Using direct box from VLM: {box_xyxy}")
-                elif pred.grid_cell:
-                    # VLM returned grid cell reference - resolve to pixel coordinates
+                # Get cell center point for point prompt
+                point_xy = None
+                if pred.grid_cell:
                     col, row = pred.grid_cell
                     cell = self._vlm_judge.grid.get_cell(col, row)
                     if cell:
-                        box_xyxy = [cell.x_min, cell.y_min, cell.x_max, cell.y_max]
-                        logger.info(f"[Frame {frame.frame_index}] Resolved grid cell ({col}, {row}) -> {cell.label} -> box {box_xyxy}")
-                    else:
-                        logger.warning(f"[Frame {frame.frame_index}] Could not resolve grid cell ({col}, {row})")
+                        point_xy = (cell.center_x, cell.center_y)
+                        logger.debug(f"[Frame {frame.frame_index}] VLM pred {i}: {pred.defect_type} at cell ({col},{row}) -> point {point_xy}")
 
-                if box_xyxy:
-                    logger.info(f"[Frame {frame.frame_index}] SAM3 segmenting '{pred.defect_type}' with box {box_xyxy}")
-
-                    # Use SAM3 with box prompt
-                    seg_result = self._segmenter.segment_with_box(
-                        frame.image,
-                        box_xyxy,
-                        detection_id=f"{frame.frame_id}_{pred.defect_type}_{i}"
+                if point_xy:
+                    seg_result = self._segmenter.segment_with_point(
+                        frame.image,  # Original image!
+                        point_xy,
+                        detection_id=f"{frame.frame_id}_vlm_{pred.defect_type}_{i}"
                     )
-
                     if seg_result.success and seg_result.mask:
-                        # Extract geometry from mask
-                        geometry = self._geometry.extract(seg_result.mask.data)
+                        # Store with VLM confidence
+                        seg_result.mask.vlm_confidence = pred.confidence
+                        seg_result.mask.defect_type = pred.defect_type
+                        vlm_point_results.append(seg_result)
+                        logger.debug(f"[Frame {frame.frame_index}] ✓ VLM point: {pred.defect_type} (conf={pred.confidence:.2f})")
 
-                        # Create bounding box from resolved coordinates
-                        from ..models import BoundingBox
-                        bbox = BoundingBox(
-                            x_min=box_xyxy[0],
-                            y_min=box_xyxy[1],
-                            x_max=box_xyxy[2],
-                            y_max=box_xyxy[3],
-                        )
+            sam_point_time = (time.perf_counter() - sam_point_start) * 1000
+            logger.info(f"[Frame {frame.frame_index}] SAM3 Points: {len(vlm_point_results)} masks in {sam_point_time:.0f}ms")
 
-                        anomaly = AnomalyResult(
-                            anomaly_id=f"{frame.frame_id}_{pred.defect_type}_{i}",
-                            frame_id=frame.frame_id,
-                            timestamp=time.time(),
-                            defect_type=pred.defect_type,
-                            structure_type=None,
-                            bbox=bbox,
-                            mask=seg_result.mask,
-                            geometry=geometry,
-                            detection_confidence=pred.confidence,
-                            segmentation_confidence=seg_result.mask.sam_score,
-                            association_confidence=1.0,
-                        )
-                        result.vlm_judged_anomalies.append(anomaly)
-                        logger.info(f"[Frame {frame.frame_index}] ✓ Segmented: {pred.defect_type} (VLM conf={pred.confidence:.2f}, SAM score={seg_result.mask.sam_score:.2f})")
+        # ========================================
+        # STEP 5: Merge all masks with deduplication
+        # ========================================
+        merge_start = time.perf_counter()
 
-                        # Debug: Save SAM3 candidate
-                        self._debug.save_sam3_candidate(
-                            frame.frame_id,
-                            frame.frame_index,
-                            pred.defect_type,
-                            seg_result.mask.data,
-                            frame.image,
-                            seg_result.mask.sam_score
-                        )
-                    else:
-                        logger.warning(f"[Frame {frame.frame_index}] SAM3 failed for '{pred.defect_type}': {seg_result.error_message}")
-                else:
-                    logger.warning(f"[Frame {frame.frame_index}] VLM prediction {i} has no bounding box or grid_cell")
+        all_masks = []
 
-        result.segmentation_time_ms = (time.perf_counter() - seg_start) * 1000
-        result.sam_candidate_count = len(result.vlm_judged_anomalies)
+        # Add global SAM3 results
+        for res in global_results:
+            if res.success and res.mask:
+                defect_type = res.detection_id.split('_')[-2] if '_' in res.detection_id else "unknown"
+                all_masks.append({
+                    'mask': res.mask.data,
+                    'score': res.mask.sam_score,
+                    'defect_type': defect_type,
+                    'source': 'global',
+                    'vlm_confidence': None,
+                })
 
-        # Debug: Save SAM3 summary
+        # Add per-tile SAM3 results
+        for res in tile_results:
+            if res.success and res.mask:
+                defect_type = res.detection_id.split('_')[-2] if '_' in res.detection_id else "unknown"
+                all_masks.append({
+                    'mask': res.mask.data,
+                    'score': res.mask.sam_score,
+                    'defect_type': defect_type,
+                    'source': 'tile',
+                    'vlm_confidence': None,
+                })
+
+        # Add VLM-prompted point results (higher priority due to VLM confidence)
+        for res in vlm_point_results:
+            if res.success and res.mask:
+                defect_type = getattr(res.mask, 'defect_type', 'unknown')
+                vlm_conf = getattr(res.mask, 'vlm_confidence', None)
+                all_masks.append({
+                    'mask': res.mask.data,
+                    'score': res.mask.sam_score,
+                    'defect_type': defect_type,
+                    'source': 'vlm_point',
+                    'vlm_confidence': vlm_conf,
+                })
+
+        logger.info(f"[Frame {frame.frame_index}] Merge: {len(all_masks)} total masks before deduplication")
+
+        # Deduplicate by IoU
+        deduplicated = self._deduplicate_masks(all_masks, iou_threshold=0.5)
+        merge_time = (time.perf_counter() - merge_start) * 1000
+        logger.info(f"[Frame {frame.frame_index}] Merge: {len(deduplicated)} masks after deduplication ({merge_time:.0f}ms)")
+
+        # ========================================
+        # STEP 6: Create AnomalyResults from deduplicated masks
+        # ========================================
+        for i, mask_info in enumerate(deduplicated):
+            mask_data = mask_info['mask']
+            geometry = self._geometry.extract(mask_data)
+            bbox = self._extract_bbox_from_mask(mask_data)
+
+            if bbox:
+                anomaly = AnomalyResult(
+                    anomaly_id=f"{frame.frame_id}_{mask_info['defect_type']}_{i}",
+                    frame_id=frame.frame_id,
+                    timestamp=time.time(),
+                    defect_type=mask_info['defect_type'],
+                    structure_type=None,
+                    bbox=bbox,
+                    mask=SegmentationMask(data=mask_data, sam_score=mask_info['score']),
+                    geometry=geometry,
+                    detection_confidence=mask_info['vlm_confidence'] or mask_info['score'],
+                    segmentation_confidence=mask_info['score'],
+                    association_confidence=1.0,
+                )
+                result.vlm_judged_anomalies.append(anomaly)
+
+                # Debug: save each candidate
+                self._debug.save_sam3_candidate(
+                    frame.frame_id,
+                    frame.frame_index,
+                    mask_info['defect_type'],
+                    mask_data,
+                    frame.image,
+                    mask_info['score']
+                )
+
+        # Update timing
+        result.segmentation_time_ms = sam_global_time + sam_tile_time + merge_time
+        result.sam_candidate_count = len(all_masks)
+
+        # Debug summaries
         self._debug.save_sam3_summary(
             frame.frame_id,
             frame.frame_index,
@@ -410,7 +486,6 @@ class RealtimeVideoProcessor:
             result.segmentation_time_ms
         )
 
-        # Debug: Save approved detections
         if result.all_anomalies:
             self._debug.save_approved_detections(
                 frame.frame_id,
@@ -422,7 +497,6 @@ class RealtimeVideoProcessor:
 
         result.total_time_ms = (time.perf_counter() - start_time) * 1000
 
-        # Debug: Save frame timing
         self._debug.save_frame_timing(
             frame.frame_id,
             frame.frame_index,
@@ -433,9 +507,71 @@ class RealtimeVideoProcessor:
             len(result.vlm_judged_anomalies)
         )
 
-        logger.info(f"[Frame {frame.frame_index}] Complete: {len(result.all_anomalies)} anomalies segmented")
+        logger.info(
+            f"[Frame {frame.frame_index}] Complete: {len(result.all_anomalies)} anomalies "
+            f"(global:{len(global_results)}, tile:{len(tile_results)}, vlm:{len(vlm_point_results)}) "
+            f"in {result.total_time_ms:.0f}ms"
+        )
 
         return result
+
+    def _deduplicate_masks(
+        self,
+        masks: list[dict],
+        iou_threshold: float = 0.5,
+    ) -> list[dict]:
+        """
+        Deduplicate masks using IoU (Intersection over Union).
+
+        Keeps masks with highest score when IoU > threshold.
+        VLM-sourced masks get priority (have vlm_confidence set).
+
+        Args:
+            masks: List of mask dicts with 'mask', 'score', 'defect_type', 'source', 'vlm_confidence'
+            iou_threshold: Merge masks with IoU above this threshold
+
+        Returns:
+            Deduplicated list of mask dicts
+        """
+        if not masks:
+            return []
+
+        # Sort by priority: VLM-confirmed first, then by score
+        def priority_key(m):
+            vlm_boost = 1.0 if m['vlm_confidence'] else 0.0
+            return (vlm_boost, m['score'])
+
+        sorted_masks = sorted(masks, key=priority_key, reverse=True)
+
+        kept = []
+        for mask_info in sorted_masks:
+            mask = mask_info['mask']
+
+            # Check IoU with all kept masks
+            is_duplicate = False
+            for kept_info in kept:
+                iou = self._compute_mask_iou(mask, kept_info['mask'])
+                if iou > iou_threshold:
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                kept.append(mask_info)
+
+        return kept
+
+    def _compute_mask_iou(self, mask1: np.ndarray, mask2: np.ndarray) -> float:
+        """Compute IoU between two binary masks."""
+        if mask1.shape != mask2.shape:
+            return 0.0
+
+        intersection = np.logical_and(mask1 > 0, mask2 > 0).sum()
+        union = np.logical_or(mask1 > 0, mask2 > 0).sum()
+
+        if union == 0:
+            return 0.0
+
+        return float(intersection) / float(union)
 
     async def _process_frame(self, frame: BufferedFrame) -> FrameResult:
         """
