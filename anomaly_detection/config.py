@@ -13,7 +13,7 @@ from typing import Optional
 DEFAULT_ANOMALY_CLASSES = {
     "cracks", "corrosions", "spallings", "deformations", "stains",
     "efflorescences", "exposed_rebars", "delaminations", "scaling",
-    "popouts", "honeycombs", "rusts", "land Cracks", "surface defects",
+    "popouts", "paint defects", "rusts", "land Cracks", "surface defects",
 }
 
 # Performance constants
