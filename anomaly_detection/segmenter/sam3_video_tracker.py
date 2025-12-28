@@ -5,7 +5,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
 
-from .config import SegmenterConfig
+from .sam3_segmenter import SegmenterConfig
 from ..models import SegmentationMask
 
 logger = logging.getLogger(__name__)
