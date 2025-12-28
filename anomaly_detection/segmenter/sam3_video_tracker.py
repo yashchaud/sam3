@@ -147,16 +147,21 @@ class SAM3VideoTracker:
                 with torch.no_grad():
                     outputs = self._model(**inputs)
 
-                # Post-process
+                # Post-process with lower thresholds for text-based detection
+                # Text prompts are less precise than point/box, so we use more lenient thresholds
+                text_score_threshold = min(self.config.score_threshold, 0.15)
+                text_mask_threshold = min(self.config.mask_threshold, 0.3)
+
                 results = self._processor.post_process_instance_segmentation(
                     outputs,
-                    threshold=self.config.score_threshold,
-                    mask_threshold=self.config.mask_threshold,
+                    threshold=text_score_threshold,
+                    mask_threshold=text_mask_threshold,
                     target_sizes=[[frame.shape[0], frame.shape[1]]]
                 )[0]
 
                 # Create tracks for each detected mask
-                if len(results.get('masks', [])) > 0:
+                num_masks = len(results.get('masks', []))
+                if num_masks > 0:
                     for i, mask_tensor in enumerate(results['masks']):
                         # Extract mask
                         if hasattr(mask_tensor, 'cpu'):

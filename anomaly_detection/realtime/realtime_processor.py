@@ -750,62 +750,36 @@ class RealtimeVideoProcessor:
         result: FrameResult,
         start_time: float
     ) -> FrameResult:
-        """Process frame using SAM3 Video Tracker for efficient temporal tracking."""
+        """Process frame using SAM3 Video Tracker with continuous rotating detection.
+
+        Strategy:
+        - Run rotating class detection on EVERY frame (2-3 classes per frame)
+        - This ensures all classes are checked multiple times per second
+        - New detections are added as new tracks
+        - Existing tracks are propagated for temporal consistency
+        """
         seg_start = time.perf_counter()
 
         all_anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]
 
-        # First frame: Initialize tracking with text prompts
+        # Reset tracker on first frame
         if frame.frame_index == 0:
-            # Use all classes on first frame to establish initial tracks
-            logger.info(f"[Frame 0] Initializing video tracker with {len(all_anomaly_classes)} classes")
-
             self._video_tracker.reset_tracking()
-            tracks = self._video_tracker.initialize_with_text_prompts(
-                frame.image,
-                all_anomaly_classes,
-                frame_idx=frame.frame_index
-            )
+            logger.info(f"[Frame 0] Reset video tracker, starting continuous detection")
 
-            # Convert tracks to anomalies
-            for track in tracks:
-                if len(track.masks) > 0:
-                    mask_data = track.masks[-1]
-                    bbox = self._extract_bbox_from_mask(mask_data)
-
-                    if bbox:
-                        anomaly = AnomalyResult(
-                            anomaly_id=f"{frame.frame_id}_{track.defect_type}_t{track.track_id}",
-                            frame_id=frame.frame_id,
-                            timestamp=frame.timestamp,
-                            defect_type=track.defect_type,
-                            structure_type=None,
-                            bbox=bbox,
-                            mask=SegmentationMask(data=mask_data, sam_score=track.confidences[-1]),
-                            geometry=self._geometry.extract(mask_data),
-                            detection_confidence=track.confidences[-1],
-                            segmentation_confidence=track.confidences[-1],
-                            association_confidence=1.0,
-                        )
-                        result.anomalies.append(anomaly)
-
-            logger.info(f"[Frame 0] Initialized {len(tracks)} tracks, {len(result.anomalies)} anomalies")
-
-        else:
-            # Subsequent frames: Propagate existing tracks efficiently
-            logger.info(f"[Frame {frame.frame_index}] Propagating tracks")
-
-            frame_masks = self._video_tracker.propagate_tracks(
+        # === STEP 1: Propagate existing tracks (temporal consistency) ===
+        propagated_masks = {}
+        if frame.frame_index > 0:
+            propagated_masks = self._video_tracker.propagate_tracks(
                 frame.image,
                 frame_idx=frame.frame_index
             )
 
             # Convert propagated tracks to anomalies
-            for track_id, mask_data in frame_masks.items():
+            for track_id, mask_data in propagated_masks.items():
                 track = self._video_tracker.get_track(track_id)
                 if track:
                     bbox = self._extract_bbox_from_mask(mask_data)
-
                     if bbox:
                         anomaly = AnomalyResult(
                             anomaly_id=f"{frame.frame_id}_{track.defect_type}_t{track_id}",
@@ -822,7 +796,59 @@ class RealtimeVideoProcessor:
                         )
                         result.anomalies.append(anomaly)
 
-            logger.info(f"[Frame {frame.frame_index}] Propagated {len(frame_masks)} tracks, {len(result.anomalies)} anomalies")
+        # === STEP 2: Rotating class detection for NEW anomalies ===
+        # Run 2 classes per frame, cycling through all classes
+        # With 14 classes and 30fps, we cover all classes every ~0.25 seconds
+        num_classes = len(all_anomaly_classes)
+        classes_per_frame = 2
+        start_idx = (frame.frame_index * classes_per_frame) % num_classes
+        rotating_classes = [
+            all_anomaly_classes[(start_idx + i) % num_classes]
+            for i in range(classes_per_frame)
+        ]
+
+        logger.info(f"[Frame {frame.frame_index}] Propagated {len(propagated_masks)} tracks, scanning for: {', '.join(rotating_classes)}")
+
+        # Run SAM3 text detection for rotating classes
+        new_tracks = self._video_tracker.initialize_with_text_prompts(
+            frame.image,
+            rotating_classes,
+            frame_idx=frame.frame_index
+        )
+
+        # Add new detections as anomalies (these are now being tracked too)
+        for track in new_tracks:
+            if len(track.masks) > 0:
+                mask_data = track.masks[-1]
+                bbox = self._extract_bbox_from_mask(mask_data)
+
+                if bbox:
+                    # Check if this detection overlaps significantly with existing tracks
+                    # to avoid duplicates
+                    is_duplicate = False
+                    for existing_mask in propagated_masks.values():
+                        iou = self._compute_mask_iou(mask_data, existing_mask)
+                        if iou > 0.5:
+                            is_duplicate = True
+                            break
+
+                    if not is_duplicate:
+                        anomaly = AnomalyResult(
+                            anomaly_id=f"{frame.frame_id}_{track.defect_type}_t{track.track_id}",
+                            frame_id=frame.frame_id,
+                            timestamp=frame.timestamp,
+                            defect_type=track.defect_type,
+                            structure_type=None,
+                            bbox=bbox,
+                            mask=SegmentationMask(data=mask_data, sam_score=track.confidences[-1]),
+                            geometry=self._geometry.extract(mask_data),
+                            detection_confidence=track.confidences[-1],
+                            segmentation_confidence=track.confidences[-1],
+                            association_confidence=1.0,
+                        )
+                        result.anomalies.append(anomaly)
+
+        logger.info(f"[Frame {frame.frame_index}] Total: {len(result.anomalies)} anomalies ({len(propagated_masks)} propagated, {len(new_tracks)} new)")
 
         result.segmentation_time_ms = (time.perf_counter() - seg_start) * 1000
         result.sam_candidate_count = len(result.anomalies)
