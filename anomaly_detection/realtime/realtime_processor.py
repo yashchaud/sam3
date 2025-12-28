@@ -84,10 +84,16 @@ class RealtimeVideoProcessor:
     Real-time video processor with SAM3-first pipeline + VLM judging.
 
     Pipeline:
-    1. SAM3 segments ALL default anomaly classes (CRACK, CORROSION, etc.) as text prompts
+    1. SAM3 segments ALL default anomaly classes (Crack, Corrosion, etc.) as text prompts
     2. Submit SAM3 candidates to VLM for judging (async)
     3. VLM judges which candidates are real anomalies
     4. Only keep VLM-approved detections
+
+    Supports:
+    - Video files (MP4, AVI, etc.)
+    - Webcam/live camera streams
+    - RTSP streams
+    - Image sequences
     """
 
     def __init__(self, config: RealtimeConfig):
@@ -245,7 +251,7 @@ class RealtimeVideoProcessor:
         Process a single buffered frame using SAM3-first pipeline.
 
         Pipeline:
-        1. SAM3 segments ALL default anomaly classes (in CAPS as text prompts)
+        1. SAM3 segments ALL default anomaly classes (Title Case as text prompts)
         2. Submit SAM3 candidates to VLM for judging (async)
         3. Check for ready VLM judgments from previous frames
         4. Only keep VLM-approved detections
@@ -259,9 +265,9 @@ class RealtimeVideoProcessor:
             timestamp=frame.timestamp,
         )
 
-        # STEP 1: Run SAM3 on ALL default anomaly classes (in CAPS)
+        # STEP 1: Run SAM3 on ALL default anomaly classes (Title Case - first letter caps)
         seg_start = time.perf_counter()
-        anomaly_classes = [cls.upper() for cls in DEFAULT_ANOMALY_CLASSES]  # Convert to CAPS
+        anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]  # Convert to Title Case
 
         logger.info(f"[Frame {frame.frame_index}] Running SAM3 on {len(anomaly_classes)} anomaly classes: {', '.join(anomaly_classes)}")
 
@@ -309,7 +315,7 @@ class RealtimeVideoProcessor:
                 for pred in response.predictions:
                     verdict = "✓ APPROVED" if pred.confidence >= self.config.confidence_threshold else "✗ REJECTED"
                     logger.info(
-                        f"  {verdict}: {pred.defect_type.upper()}, confidence: {pred.confidence:.2f}"
+                        f"  {verdict}: {pred.defect_type.title()}, confidence: {pred.confidence:.2f}"
                     )
 
             # STEP 4: Filter SAM3 candidates by VLM judgment
@@ -341,7 +347,7 @@ class RealtimeVideoProcessor:
         Args:
             image: RGB image
             frame_id: Frame identifier
-            anomaly_classes: List of defect types in CAPS (CRACK, CORROSION, etc.)
+            anomaly_classes: List of defect types in Title Case (Crack, Corrosion, etc.)
 
         Returns:
             List of SAM candidate masks
