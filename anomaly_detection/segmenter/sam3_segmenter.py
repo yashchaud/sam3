@@ -397,15 +397,21 @@ class SAM3Segmenter:
         point_xy: tuple[int, int],
         detection_id: str = "point_segment",
         label: int = 1,
+        box_size: int = 50,
     ) -> SegmentationResult:
         """
-        Segment using a point prompt.
+        Segment using a point prompt by converting it to a small box.
+
+        Note: SAM3 (Sam3Model) doesn't support point prompts directly via input_points.
+        Point prompts require Sam3TrackerModel. This method converts points to small
+        boxes around the point location for use with Sam3Model.
 
         Args:
             image: RGB image
             point_xy: Point as (x, y) coordinates
             detection_id: Optional ID for the result
             label: 1 for positive (foreground), 0 for negative (background)
+            box_size: Size of the box to create around the point (default 50px)
 
         Returns:
             SegmentationResult
@@ -422,12 +428,27 @@ class SAM3Segmenter:
             self.set_image(image)
             import torch
 
-            # Prepare inputs with point prompt
+            # Get image dimensions
+            h, w = image.shape[:2]
+
+            # Convert point to a small box around the point
+            # SAM3 (Sam3Model) uses input_boxes, not input_points
+            x, y = point_xy
+            half_size = box_size // 2
+            x1 = max(0, x - half_size)
+            y1 = max(0, y - half_size)
+            x2 = min(w, x + half_size)
+            y2 = min(h, y + half_size)
+
+            # input_boxes format: [[[x1, y1, x2, y2]]] - xyxy format in pixel coordinates
+            input_boxes = [[[x1, y1, x2, y2]]]
+            input_boxes_labels = [[label]]  # 1 = positive, 0 = negative
+
+            # Prepare inputs with box prompt (converted from point)
             inputs = self._processor(
                 images=self._current_image,
-                text=None,
-                input_points=[[[point_xy[0], point_xy[1]]]],
-                input_labels=[[label]],
+                input_boxes=input_boxes,
+                input_boxes_labels=input_boxes_labels,
                 return_tensors="pt"
             ).to(self._device)
 
@@ -480,7 +501,7 @@ class SAM3Segmenter:
                 mask_data = mask_data.squeeze()
             mask_binary = (mask_data > 0).astype(np.uint8)
 
-            logger.debug(f"SAM3 point segment: point={point_xy}, score={sam_score:.3f}, area={mask_binary.sum()}")
+            logger.info(f"SAM3 point->box segment: point={point_xy}, box=[{x1},{y1},{x2},{y2}], score={sam_score:.3f}, area={mask_binary.sum()}")
 
             return SegmentationResult(
                 detection_id=detection_id,
