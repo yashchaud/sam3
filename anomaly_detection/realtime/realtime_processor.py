@@ -110,6 +110,7 @@ class RealtimeVideoProcessor:
         # Initialize components (SAM3 + VLM Judge only, no RF-DETR)
         self._segmenter: SAM3Segmenter | None = None
         self._vlm_judge: VLMJudge | None = None
+        self._video_tracker = None  # SAM3VideoTracker for efficient video processing
         self._geometry = MaskGeometryExtractor()
 
         # Stream handling
@@ -147,6 +148,16 @@ class RealtimeVideoProcessor:
         self._segmenter = SAM3Segmenter(segmenter_config)
         self._segmenter.load()
         logger.info("SAM3 segmenter loaded")
+
+        # Initialize video tracker (SAM3TrackerModel for efficient video processing)
+        try:
+            from ..segmenter.sam3_video_tracker import SAM3VideoTracker
+            self._video_tracker = SAM3VideoTracker(segmenter_config)
+            self._video_tracker.load()
+            logger.info("SAM3 Video Tracker loaded")
+        except ImportError as e:
+            logger.warning(f"SAM3 Video Tracker not available: {e}. Will use frame-by-frame processing.")
+            self._video_tracker = None
 
         # Initialize VLM judge (required for this pipeline)
         vlm_config = self.config.get_vlm_config()
@@ -693,14 +704,13 @@ class RealtimeVideoProcessor:
 
     async def _process_frame(self, frame: BufferedFrame) -> FrameResult:
         """
-        Process a single buffered frame using SAM3-only pipeline (VLM disabled for video).
+        Process a single buffered frame using SAM3 Video Tracker for efficient temporal tracking.
 
-        For video processing, we rotate through anomaly classes (1 per frame) to reduce
-        processing time. VLM is disabled for video as it's too slow and causes timeouts.
+        Uses Sam3TrackerModel to track objects across frames with temporal consistency:
+        - First frame: Initialize tracks with text prompts
+        - Subsequent frames: Propagate existing tracks efficiently (reuses embeddings)
 
-        Pipeline:
-        1. SAM3 segments 1-2 anomaly classes per frame (rotating through all classes)
-        2. Results are shown immediately without VLM validation
+        Falls back to frame-by-frame processing if video tracker is unavailable.
         """
         start_time = time.perf_counter()
 
@@ -714,9 +724,135 @@ class RealtimeVideoProcessor:
         # Debug: Save original frame
         self._debug.save_original_frame(frame.frame_id, frame.frame_index, frame.image)
 
-        # STEP 1: Run SAM3 on ROTATING anomaly classes (1-2 per frame for video speed)
+        # Use video tracker if available
+        if self._video_tracker and self._video_tracker.is_loaded():
+            result = await self._process_frame_with_tracker(frame, result, start_time)
+        else:
+            # Fallback to frame-by-frame processing
+            result = await self._process_frame_fallback(frame, result, start_time)
+
+        # Debug: Save frame timing
+        self._debug.save_frame_timing(
+            frame.frame_id,
+            frame.frame_index,
+            result.segmentation_time_ms,
+            result.vlm_time_ms,
+            result.total_time_ms,
+            result.sam_candidate_count,
+            len(result.vlm_judged_anomalies)
+        )
+
+        return result
+
+    async def _process_frame_with_tracker(
+        self,
+        frame: BufferedFrame,
+        result: FrameResult,
+        start_time: float
+    ) -> FrameResult:
+        """Process frame using SAM3 Video Tracker for efficient temporal tracking."""
         seg_start = time.perf_counter()
-        all_anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]  # Convert to Title Case
+
+        all_anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]
+
+        # First frame: Initialize tracking with text prompts
+        if frame.frame_index == 0:
+            # Use all classes on first frame to establish initial tracks
+            logger.info(f"[Frame 0] Initializing video tracker with {len(all_anomaly_classes)} classes")
+
+            self._video_tracker.reset_tracking()
+            tracks = self._video_tracker.initialize_with_text_prompts(
+                frame.image,
+                all_anomaly_classes,
+                frame_idx=frame.frame_index
+            )
+
+            # Convert tracks to anomalies
+            for track in tracks:
+                if len(track.masks) > 0:
+                    mask_data = track.masks[-1]
+                    bbox = self._extract_bbox_from_mask(mask_data)
+
+                    if bbox:
+                        anomaly = AnomalyResult(
+                            anomaly_id=f"{frame.frame_id}_{track.defect_type}_t{track.track_id}",
+                            frame_id=frame.frame_id,
+                            timestamp=frame.timestamp,
+                            defect_type=track.defect_type,
+                            structure_type=None,
+                            bbox=bbox,
+                            mask=SegmentationMask(data=mask_data, sam_score=track.confidences[-1]),
+                            geometry=self._geometry.extract(mask_data),
+                            detection_confidence=track.confidences[-1],
+                            segmentation_confidence=track.confidences[-1],
+                            association_confidence=1.0,
+                        )
+                        result.anomalies.append(anomaly)
+
+            logger.info(f"[Frame 0] Initialized {len(tracks)} tracks, {len(result.anomalies)} anomalies")
+
+        else:
+            # Subsequent frames: Propagate existing tracks efficiently
+            logger.info(f"[Frame {frame.frame_index}] Propagating tracks")
+
+            frame_masks = self._video_tracker.propagate_tracks(
+                frame.image,
+                frame_idx=frame.frame_index
+            )
+
+            # Convert propagated tracks to anomalies
+            for track_id, mask_data in frame_masks.items():
+                track = self._video_tracker.get_track(track_id)
+                if track:
+                    bbox = self._extract_bbox_from_mask(mask_data)
+
+                    if bbox:
+                        anomaly = AnomalyResult(
+                            anomaly_id=f"{frame.frame_id}_{track.defect_type}_t{track_id}",
+                            frame_id=frame.frame_id,
+                            timestamp=frame.timestamp,
+                            defect_type=track.defect_type,
+                            structure_type=None,
+                            bbox=bbox,
+                            mask=SegmentationMask(data=mask_data, sam_score=track.confidences[-1]),
+                            geometry=self._geometry.extract(mask_data),
+                            detection_confidence=track.confidences[-1],
+                            segmentation_confidence=track.confidences[-1],
+                            association_confidence=1.0,
+                        )
+                        result.anomalies.append(anomaly)
+
+            logger.info(f"[Frame {frame.frame_index}] Propagated {len(frame_masks)} tracks, {len(result.anomalies)} anomalies")
+
+        result.segmentation_time_ms = (time.perf_counter() - seg_start) * 1000
+        result.sam_candidate_count = len(result.anomalies)
+        result.vlm_time_ms = 0.0  # VLM disabled for video
+        result.total_time_ms = (time.perf_counter() - start_time) * 1000
+
+        # Debug: Save SAM3 summary
+        self._debug.save_sam3_summary(
+            frame.frame_id,
+            frame.frame_index,
+            len(result.anomalies),
+            [a.defect_type for a in result.anomalies],
+            result.segmentation_time_ms
+        )
+
+        return result
+
+    async def _process_frame_fallback(
+        self,
+        frame: BufferedFrame,
+        result: FrameResult,
+        start_time: float
+    ) -> FrameResult:
+        """
+        Fallback frame processing when video tracker is unavailable.
+
+        Processes frames independently using class rotation (2 classes per frame).
+        """
+        seg_start = time.perf_counter()
+        all_anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]
 
         # Rotate: use 2 classes per frame, cycling through all classes
         num_classes = len(all_anomaly_classes)
@@ -748,8 +884,7 @@ class RealtimeVideoProcessor:
             result.segmentation_time_ms
         )
 
-        # STEP 2: Convert SAM3 candidates directly to anomalies (NO VLM for video)
-        # VLM is disabled for video processing as it's too slow and causes timeouts
+        # Convert SAM3 candidates directly to anomalies (NO VLM for video)
         for candidate in sam_candidates:
             anomaly = AnomalyResult(
                 anomaly_id=f"{frame.frame_id}_{candidate.defect_type}",
@@ -769,18 +904,77 @@ class RealtimeVideoProcessor:
         result.vlm_time_ms = 0.0  # VLM disabled for video
         result.total_time_ms = (time.perf_counter() - start_time) * 1000
 
-        # Debug: Save frame timing
-        self._debug.save_frame_timing(
-            frame.frame_id,
-            frame.frame_index,
-            result.segmentation_time_ms,
-            result.vlm_time_ms,
-            result.total_time_ms,
-            result.sam_candidate_count,
-            len(result.vlm_judged_anomalies)
-        )
-
         return result
+
+    def add_point_to_video_track(
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        point_xy: tuple[int, int],
+        defect_type: str,
+        is_positive: bool = True,
+    ) -> int | None:
+        """
+        Add a new object to track in the video via point prompt.
+
+        This allows frame-level refinement of video tracking by adding point prompts
+        on specific frames during video processing.
+
+        Args:
+            frame: RGB image (HWC)
+            frame_idx: Frame index
+            point_xy: Point coordinates (x, y)
+            defect_type: Type of defect to track
+            is_positive: True for positive point (foreground), False for negative
+
+        Returns:
+            Track ID if successful, None otherwise
+        """
+        if not self._video_tracker or not self._video_tracker.is_loaded():
+            logger.warning("Video tracker not available, cannot add point prompt")
+            return None
+
+        try:
+            track = self._video_tracker.add_point_prompt(
+                frame=frame,
+                frame_idx=frame_idx,
+                point_xy=point_xy,
+                defect_type=defect_type,
+                is_positive=is_positive,
+            )
+
+            if track:
+                logger.info(f"Added track {track.track_id} via point prompt at {point_xy} on frame {frame_idx}")
+                return track.track_id
+            else:
+                logger.warning(f"Failed to add track via point prompt at {point_xy} on frame {frame_idx}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error adding point prompt to video track: {e}")
+            return None
+
+    def get_video_tracks(self) -> list:
+        """
+        Get all active video tracks.
+
+        Returns:
+            List of TrackingState objects representing active tracks
+        """
+        if not self._video_tracker or not self._video_tracker.is_loaded():
+            return []
+
+        return self._video_tracker.get_active_tracks()
+
+    def deactivate_video_track(self, track_id: int) -> None:
+        """
+        Deactivate a specific video track.
+
+        Args:
+            track_id: ID of track to deactivate
+        """
+        if self._video_tracker and self._video_tracker.is_loaded():
+            self._video_tracker.deactivate_track(track_id)
 
     async def _segment_all_anomaly_classes(
         self,

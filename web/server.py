@@ -473,7 +473,7 @@ async def process_video(file: UploadFile = File(...)):
 
 
 async def process_video_task(video_path: str):
-    """Background task for video processing."""
+    """Background task for video processing using SAM3 Video Tracker."""
     global state
 
     state.is_processing = True
@@ -482,10 +482,11 @@ async def process_video_task(video_path: str):
     state.results_buffer = []
 
     try:
-        # Open video
+        # Get video metadata
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
 
         await broadcast_message({
             "type": "video_start",
@@ -493,24 +494,27 @@ async def process_video_task(video_path: str):
             "total_frames": total_frames,
         })
 
+        # Process video using processor.process_video() with video tracker
+        from ..realtime import FrameSource
+
         frame_idx = 0
 
-        while cap.isOpened() and state.is_processing:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # Convert BGR to RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            # Process frame
-            result = await state.processor.process_single_image(
-                frame_rgb,
-                frame_id=f"frame_{frame_idx:06d}"
-            )
-
-            state.frames_processed = frame_idx + 1
+        # Process video with video tracker - this yields FrameResult for each frame
+        async for result in state.processor.process_video(source_path=video_path, source_type=FrameSource.FILE):
+            state.frames_processed = result.frame_index + 1
             state.total_detections += len(result.all_anomalies)
+
+            # We need to get the frame image for annotation
+            # The video tracker processes frames internally, we need to read them separately for display
+            cap_temp = cv2.VideoCapture(video_path)
+            cap_temp.set(cv2.CAP_PROP_POS_FRAMES, result.frame_index)
+            ret, frame = cap_temp.read()
+            cap_temp.release()
+
+            if not ret:
+                continue
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Draw annotations
             annotated = frame_rgb.copy()
@@ -544,20 +548,16 @@ async def process_video_task(video_path: str):
             # Broadcast to clients
             await broadcast_message({
                 "type": "frame",
-                "frame_index": frame_idx,
+                "frame_index": result.frame_index,
                 "image": f"data:image/jpeg;base64,{img_base64}",
                 "anomaly_count": len(result.all_anomalies),
                 "vlm_judged_count": len(result.vlm_judged_anomalies),
                 "timing_ms": result.total_time_ms,
-                "progress": (frame_idx + 1) / total_frames,
+                "progress": (result.frame_index + 1) / total_frames if total_frames > 0 else 0,
             })
-
-            frame_idx += 1
 
             # Small delay to prevent overwhelming clients
             await asyncio.sleep(0.01)
-
-        cap.release()
 
         # Get final stats
         stats = state.processor.get_stats()
@@ -567,7 +567,6 @@ async def process_video_task(video_path: str):
             "frames_processed": state.frames_processed,
             "total_detections": state.total_detections,
             "avg_fps": stats.avg_fps,
-            "vlm_stats": stats.vlm_stats,
         })
 
     except Exception as e:
@@ -737,6 +736,112 @@ async def process_stream_task(source, is_webcam: bool = False):
 
     finally:
         state.is_processing = False
+
+
+@app.post("/api/video/track/add_point")
+async def add_point_to_track(request: dict):
+    """
+    Add a point prompt to create a new track in video processing.
+
+    Request body:
+    {
+        "frame": <base64 image>,
+        "frame_idx": <int>,
+        "point_x": <int>,
+        "point_y": <int>,
+        "defect_type": <str>,
+        "is_positive": <bool> (optional, default True)
+    }
+    """
+    global state
+
+    if state.processor is None or not state.processor.is_loaded():
+        raise HTTPException(status_code=400, detail="Models not loaded")
+
+    try:
+        # Decode frame from base64
+        import base64
+        frame_data = base64.b64decode(request["frame"].split(",")[1] if "," in request["frame"] else request["frame"])
+        frame_array = np.frombuffer(frame_data, dtype=np.uint8)
+        frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Add point prompt to video tracker
+        track_id = state.processor.add_point_to_video_track(
+            frame=frame_rgb,
+            frame_idx=request["frame_idx"],
+            point_xy=(request["point_x"], request["point_y"]),
+            defect_type=request["defect_type"],
+            is_positive=request.get("is_positive", True),
+        )
+
+        if track_id is not None:
+            return {
+                "status": "ok",
+                "track_id": track_id,
+                "message": f"Track {track_id} created successfully"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to create track")
+
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing required field: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/video/tracks")
+async def get_video_tracks():
+    """Get all active video tracks."""
+    global state
+
+    if state.processor is None or not state.processor.is_loaded():
+        raise HTTPException(status_code=400, detail="Models not loaded")
+
+    try:
+        tracks = state.processor.get_video_tracks()
+
+        # Convert TrackingState objects to dicts
+        tracks_data = []
+        for track in tracks:
+            tracks_data.append({
+                "track_id": track.track_id,
+                "defect_type": track.defect_type,
+                "is_active": track.is_active,
+                "frame_count": len(track.frame_indices),
+                "first_frame": track.frame_indices[0] if track.frame_indices else None,
+                "last_frame": track.frame_indices[-1] if track.frame_indices else None,
+                "avg_confidence": sum(track.confidences) / len(track.confidences) if track.confidences else 0.0,
+            })
+
+        return {
+            "status": "ok",
+            "tracks": tracks_data,
+            "total_tracks": len(tracks_data)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/video/track/{track_id}")
+async def deactivate_track(track_id: int):
+    """Deactivate a specific video track."""
+    global state
+
+    if state.processor is None or not state.processor.is_loaded():
+        raise HTTPException(status_code=400, detail="Models not loaded")
+
+    try:
+        state.processor.deactivate_video_track(track_id)
+
+        return {
+            "status": "ok",
+            "message": f"Track {track_id} deactivated"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.websocket("/ws")
