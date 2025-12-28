@@ -509,7 +509,7 @@ class SAM3Segmenter:
         prefix: str = "batch",
     ) -> list[SegmentationResult]:
         """
-        Segment image using multiple text prompts (batch).
+        Segment image using multiple text prompts in a TRUE batch (single forward pass).
 
         Args:
             image: RGB image (original, no grid overlay)
@@ -528,41 +528,45 @@ class SAM3Segmenter:
         try:
             import torch
 
-            for i, text_prompt in enumerate(text_prompts):
-                detection_id = f"{prefix}_{text_prompt}_{i}"
+            # Try true batch processing first (all prompts in single forward pass)
+            try:
+                # Prepare batched inputs - replicate image for each text prompt
+                images = [self._current_image] * len(text_prompts)
 
-                try:
-                    # Prepare inputs for SAM3 with text prompt
-                    inputs = self._processor(
-                        images=self._current_image,
-                        text=text_prompt,
-                        return_tensors="pt"
-                    ).to(self._device)
+                inputs = self._processor(
+                    images=images,
+                    text=text_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self._device)
 
-                    # Run prediction
-                    with torch.no_grad():
-                        outputs = self._model(**inputs)
+                # Single forward pass for ALL prompts
+                with torch.no_grad():
+                    outputs = self._model(**inputs)
 
-                    # Get original sizes
-                    original_sizes = inputs.get("original_sizes")
-                    if original_sizes is not None:
-                        target_sizes = original_sizes.tolist()
-                    else:
-                        target_sizes = [list(self._current_image_size)] if self._current_image_size else None
+                # Get target sizes for all images in batch
+                original_sizes = inputs.get("original_sizes")
+                if original_sizes is not None:
+                    target_sizes = original_sizes.tolist()
+                else:
+                    target_sizes = [list(self._current_image_size)] * len(text_prompts)
 
-                    # Post-process results
-                    proc_results = self._processor.post_process_instance_segmentation(
-                        outputs,
-                        threshold=self.config.score_threshold,
-                        mask_threshold=self.config.mask_threshold,
-                        target_sizes=target_sizes
-                    )[0]
+                # Post-process all results at once
+                all_results = self._processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=self.config.score_threshold,
+                    mask_threshold=self.config.mask_threshold,
+                    target_sizes=target_sizes
+                )
 
-                    if len(proc_results['masks']) == 0:
+                # Extract results for each prompt
+                for i, (text_prompt, proc_results) in enumerate(zip(text_prompts, all_results)):
+                    detection_id = f"{prefix}_{text_prompt}_{i}"
+
+                    if len(proc_results.get('masks', [])) == 0:
                         logger.debug(f"SAM3 batch: No mask for '{text_prompt}'")
                         continue
 
-                    # Get the first/best mask
                     mask_tensor = proc_results['masks'][0]
                     if hasattr(mask_tensor, 'cpu'):
                         mask_data = mask_tensor.cpu().numpy()
@@ -584,11 +588,10 @@ class SAM3Segmenter:
                         mask_data = mask_data.squeeze()
                     mask_binary = (mask_data > 0).astype(np.uint8)
 
-                    # Skip empty masks
                     if mask_binary.sum() == 0:
                         continue
 
-                    logger.debug(f"SAM3 batch: Found '{text_prompt}', score={sam_score:.3f}, area={mask_binary.sum()}")
+                    logger.debug(f"SAM3 batch: Found '{text_prompt}', score={sam_score:.3f}")
 
                     results.append(SegmentationResult(
                         detection_id=detection_id,
@@ -599,12 +602,90 @@ class SAM3Segmenter:
                         success=True,
                     ))
 
-                except Exception as e:
-                    logger.warning(f"SAM3 batch error for '{text_prompt}': {e}")
-                    continue
+                logger.info(f"SAM3 batch: Processed {len(text_prompts)} prompts in single forward pass, got {len(results)} masks")
+
+            except Exception as batch_error:
+                # Fallback to sequential if true batch fails
+                logger.warning(f"SAM3 true batch failed ({batch_error}), falling back to sequential")
+                results = self._segment_text_sequential(text_prompts, prefix)
 
         finally:
             self.clear_image()
+
+        return results
+
+    def _segment_text_sequential(
+        self,
+        text_prompts: list[str],
+        prefix: str,
+    ) -> list[SegmentationResult]:
+        """Fallback sequential text prompt processing."""
+        import torch
+        results = []
+
+        for i, text_prompt in enumerate(text_prompts):
+            detection_id = f"{prefix}_{text_prompt}_{i}"
+
+            try:
+                inputs = self._processor(
+                    images=self._current_image,
+                    text=text_prompt,
+                    return_tensors="pt"
+                ).to(self._device)
+
+                with torch.no_grad():
+                    outputs = self._model(**inputs)
+
+                original_sizes = inputs.get("original_sizes")
+                if original_sizes is not None:
+                    target_sizes = original_sizes.tolist()
+                else:
+                    target_sizes = [list(self._current_image_size)] if self._current_image_size else None
+
+                proc_results = self._processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=self.config.score_threshold,
+                    mask_threshold=self.config.mask_threshold,
+                    target_sizes=target_sizes
+                )[0]
+
+                if len(proc_results['masks']) == 0:
+                    continue
+
+                mask_tensor = proc_results['masks'][0]
+                if hasattr(mask_tensor, 'cpu'):
+                    mask_data = mask_tensor.cpu().numpy()
+                else:
+                    mask_data = np.array(mask_tensor)
+
+                if len(proc_results.get('scores', [])) > 0:
+                    score_tensor = proc_results['scores'][0]
+                    if hasattr(score_tensor, 'cpu'):
+                        sam_score = float(score_tensor.cpu().numpy())
+                    else:
+                        sam_score = float(score_tensor)
+                else:
+                    sam_score = 1.0
+
+                if mask_data.ndim > 2:
+                    mask_data = mask_data.squeeze()
+                mask_binary = (mask_data > 0).astype(np.uint8)
+
+                if mask_binary.sum() == 0:
+                    continue
+
+                results.append(SegmentationResult(
+                    detection_id=detection_id,
+                    mask=SegmentationMask(
+                        data=mask_binary,
+                        sam_score=sam_score,
+                    ),
+                    success=True,
+                ))
+
+            except Exception as e:
+                logger.warning(f"SAM3 sequential error for '{text_prompt}': {e}")
+                continue
 
         return results
 
@@ -617,10 +698,9 @@ class SAM3Segmenter:
         prefix: str = "tile",
     ) -> list[SegmentationResult]:
         """
-        Segment image tiles using text prompts.
+        Segment image tiles using text prompts - BATCHED across all tiles.
 
-        Splits image into grid, runs text prompts on each tile,
-        then transforms masks back to full image coordinates.
+        Batches all (tile, prompt) pairs into a single forward pass for efficiency.
 
         Args:
             image: RGB image (original, no grid overlay)
@@ -635,52 +715,151 @@ class SAM3Segmenter:
         if not self.is_loaded():
             return []
 
+        from PIL import Image
+        import torch
+
         h, w = image.shape[:2]
         tile_h = h // grid_rows
         tile_w = w // grid_cols
 
-        all_results = []
+        # Collect all tiles and their metadata
+        tiles_data = []  # [(tile_pil, tile_label, y_start, x_start, y_end, x_end), ...]
 
         for row in range(grid_rows):
             for col in range(grid_cols):
-                # Calculate tile bounds
                 y_start = row * tile_h
                 x_start = col * tile_w
-
-                # Handle last row/col to capture remaining pixels
                 y_end = h if row == grid_rows - 1 else (row + 1) * tile_h
                 x_end = w if col == grid_cols - 1 else (col + 1) * tile_w
 
-                # Extract tile
                 tile = image[y_start:y_end, x_start:x_end]
-                tile_label = f"{chr(65 + row)}{col + 1}"  # A1, A2, B1, etc.
+                tile_label = f"{chr(65 + row)}{col + 1}"
 
-                logger.debug(f"SAM3 tile {tile_label}: bounds=({x_start},{y_start})-({x_end},{y_end})")
+                # Convert to PIL
+                if tile.dtype != np.uint8:
+                    tile = (tile * 255).astype(np.uint8)
+                tile_pil = Image.fromarray(tile)
 
-                # Run text prompts on this tile
-                tile_results = self.segment_with_text_batch(
-                    tile,
-                    text_prompts,
-                    prefix=f"{prefix}_{tile_label}"
-                )
+                tiles_data.append((tile_pil, tile_label, y_start, x_start, y_end, x_end))
 
-                # Transform masks back to full image coordinates
-                for result in tile_results:
-                    if result.success and result.mask and result.mask.data is not None:
-                        # Create full-size mask
+        all_results = []
+
+        try:
+            # Build mega-batch: all tiles × all prompts
+            all_images = []
+            all_texts = []
+            all_metadata = []  # (tile_idx, prompt_idx, tile_label, bounds)
+
+            for tile_idx, (tile_pil, tile_label, y_start, x_start, y_end, x_end) in enumerate(tiles_data):
+                for prompt_idx, text_prompt in enumerate(text_prompts):
+                    all_images.append(tile_pil)
+                    all_texts.append(text_prompt)
+                    all_metadata.append({
+                        'tile_idx': tile_idx,
+                        'prompt_idx': prompt_idx,
+                        'tile_label': tile_label,
+                        'text_prompt': text_prompt,
+                        'y_start': y_start,
+                        'x_start': x_start,
+                        'tile_h': y_end - y_start,
+                        'tile_w': x_end - x_start,
+                    })
+
+            logger.info(f"SAM3 tiles: Processing {len(all_images)} (tile,prompt) pairs in batched mode")
+
+            # Process in chunks to avoid OOM (e.g., 12 at a time)
+            chunk_size = min(12, len(all_images))  # Process up to 12 at once
+
+            for chunk_start in range(0, len(all_images), chunk_size):
+                chunk_end = min(chunk_start + chunk_size, len(all_images))
+                chunk_images = all_images[chunk_start:chunk_end]
+                chunk_texts = all_texts[chunk_start:chunk_end]
+                chunk_meta = all_metadata[chunk_start:chunk_end]
+
+                try:
+                    inputs = self._processor(
+                        images=chunk_images,
+                        text=chunk_texts,
+                        return_tensors="pt",
+                        padding=True,
+                    ).to(self._device)
+
+                    with torch.no_grad():
+                        outputs = self._model(**inputs)
+
+                    # Build target sizes for this chunk
+                    target_sizes = [[m['tile_h'], m['tile_w']] for m in chunk_meta]
+
+                    proc_results = self._processor.post_process_instance_segmentation(
+                        outputs,
+                        threshold=self.config.score_threshold,
+                        mask_threshold=self.config.mask_threshold,
+                        target_sizes=target_sizes
+                    )
+
+                    # Extract results
+                    for meta, result in zip(chunk_meta, proc_results):
+                        if len(result.get('masks', [])) == 0:
+                            continue
+
+                        mask_tensor = result['masks'][0]
+                        if hasattr(mask_tensor, 'cpu'):
+                            mask_data = mask_tensor.cpu().numpy()
+                        else:
+                            mask_data = np.array(mask_tensor)
+
+                        if len(result.get('scores', [])) > 0:
+                            score_tensor = result['scores'][0]
+                            if hasattr(score_tensor, 'cpu'):
+                                sam_score = float(score_tensor.cpu().numpy())
+                            else:
+                                sam_score = float(score_tensor)
+                        else:
+                            sam_score = 1.0
+
+                        if mask_data.ndim > 2:
+                            mask_data = mask_data.squeeze()
+                        mask_binary = (mask_data > 0).astype(np.uint8)
+
+                        if mask_binary.sum() == 0:
+                            continue
+
+                        # Transform to full image coordinates
                         full_mask = np.zeros((h, w), dtype=np.uint8)
+                        full_mask[meta['y_start']:meta['y_start'] + mask_binary.shape[0],
+                                  meta['x_start']:meta['x_start'] + mask_binary.shape[1]] = mask_binary
 
-                        # Place tile mask in correct position
-                        tile_mask = result.mask.data
-                        full_mask[y_start:y_start + tile_mask.shape[0],
-                                  x_start:x_start + tile_mask.shape[1]] = tile_mask
+                        detection_id = f"{prefix}_{meta['tile_label']}_{meta['text_prompt']}_{meta['prompt_idx']}"
 
-                        # Update result with full-size mask
-                        result.mask = SegmentationMask(
-                            data=full_mask,
-                            sam_score=result.mask.sam_score,
-                        )
-                        all_results.append(result)
+                        all_results.append(SegmentationResult(
+                            detection_id=detection_id,
+                            mask=SegmentationMask(
+                                data=full_mask,
+                                sam_score=sam_score,
+                            ),
+                            success=True,
+                        ))
+
+                except Exception as chunk_error:
+                    logger.warning(f"SAM3 tile chunk error: {chunk_error}, processing individually")
+                    # Fallback for this chunk
+                    for img, txt, meta in zip(chunk_images, chunk_texts, chunk_meta):
+                        try:
+                            self._current_image = img
+                            self._current_image_size = (meta['tile_h'], meta['tile_w'])
+                            result = self._segment_text_sequential([txt], f"{prefix}_{meta['tile_label']}")
+                            for r in result:
+                                if r.success and r.mask:
+                                    full_mask = np.zeros((h, w), dtype=np.uint8)
+                                    full_mask[meta['y_start']:meta['y_start'] + r.mask.data.shape[0],
+                                              meta['x_start']:meta['x_start'] + r.mask.data.shape[1]] = r.mask.data
+                                    r.mask = SegmentationMask(data=full_mask, sam_score=r.mask.sam_score)
+                                    all_results.append(r)
+                        except Exception:
+                            continue
+
+        except Exception as e:
+            logger.error(f"SAM3 tiles batch error: {e}")
 
         logger.info(f"SAM3 tiles: Found {len(all_results)} masks across {grid_cols * grid_rows} tiles")
         return all_results

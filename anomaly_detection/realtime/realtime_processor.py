@@ -261,15 +261,14 @@ class RealtimeVideoProcessor:
 
     async def _process_single_image_sync(self, frame: BufferedFrame) -> FrameResult:
         """
-        Process a single image with parallel SAM3 + VLM pipeline.
+        Process a single image with TRULY PARALLEL SAM3 + VLM pipeline.
 
-        Flow (parallel):
-        1. SAM3 Global: Text prompts for all defect classes on full image
-        2. SAM3 Per-Tile: Text prompts on each grid tile (catches small defects)
-        3. VLM: Analyzes grid-overlay image → returns cell predictions
-        4. SAM3 Point: For each VLM prediction, segment with point prompt
+        Flow (concurrent):
+        1. SAM3 Global + SAM3 Tiles + VLM all run concurrently
+        2. After VLM returns, SAM3 Point prompts segment VLM predictions
+        3. Union all masks with IoU-based deduplication
 
-        Then union all masks with IoU-based deduplication.
+        This maximizes GPU utilization by overlapping SAM3 compute with VLM API latency.
         """
         start_time = time.perf_counter()
 
@@ -285,60 +284,80 @@ class RealtimeVideoProcessor:
 
         # Get defect classes for SAM3 text prompts
         anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]
-        logger.info(f"[Frame {frame.frame_index}] Starting parallel pipeline with {len(anomaly_classes)} defect classes")
+        logger.info(f"[Frame {frame.frame_index}] Starting CONCURRENT pipeline with {len(anomaly_classes)} defect classes")
 
         # Generate grid overlay for VLM (but SAM3 uses original image!)
         self._vlm_judge.grid.compute_grid(frame.image.shape[1], frame.image.shape[0])
         grid_image = self._vlm_judge.grid.draw_grid(frame.image)
         self._debug.save_vlm_grid(frame.frame_id, frame.frame_index, grid_image)
 
-        # ========================================
-        # PARALLEL STEP 1: SAM3 Global Text Prompts
-        # ========================================
-        sam_global_start = time.perf_counter()
-        logger.info(f"[Frame {frame.frame_index}] SAM3 Global: Running {len(anomaly_classes)} text prompts on full image...")
-
-        global_results = self._segmenter.segment_with_text_batch(
-            frame.image,  # Original image, no grid!
-            anomaly_classes,
-            prefix=f"{frame.frame_id}_global"
-        )
-        sam_global_time = (time.perf_counter() - sam_global_start) * 1000
-        logger.info(f"[Frame {frame.frame_index}] SAM3 Global: Found {len(global_results)} masks in {sam_global_time:.0f}ms")
-
-        # ========================================
-        # PARALLEL STEP 2: SAM3 Per-Tile Text Prompts
-        # ========================================
-        sam_tile_start = time.perf_counter()
         grid_config = self._vlm_judge.grid.config
-        logger.info(f"[Frame {frame.frame_index}] SAM3 Tiles: Running on {grid_config.cols}x{grid_config.rows} grid...")
-
-        tile_results = self._segmenter.segment_tiles_with_text(
-            frame.image,  # Original image, no grid!
-            anomaly_classes,
-            grid_cols=grid_config.cols,
-            grid_rows=grid_config.rows,
-            prefix=f"{frame.frame_id}_tile"
-        )
-        sam_tile_time = (time.perf_counter() - sam_tile_start) * 1000
-        logger.info(f"[Frame {frame.frame_index}] SAM3 Tiles: Found {len(tile_results)} masks in {sam_tile_time:.0f}ms")
 
         # ========================================
-        # PARALLEL STEP 3: VLM Analysis
+        # CONCURRENT EXECUTION: SAM3 Global + Tiles + VLM
         # ========================================
-        vlm_start = time.perf_counter()
-        logger.info(f"[Frame {frame.frame_index}] VLM: Analyzing image for defects...")
+        # VLM is async (API call), SAM3 is sync (GPU compute)
+        # Run SAM3 in thread pool while VLM awaits network
 
-        vlm_response = await self._vlm_judge.process_frame(
-            frame.image,
-            frame.frame_id,
-            frame.frame_index,
+        concurrent_start = time.perf_counter()
+        logger.info(f"[Frame {frame.frame_index}] Running SAM3 (global+tiles) and VLM concurrently...")
+
+        # Define sync functions to run in executor
+        def run_sam3_global():
+            return self._segmenter.segment_with_text_batch(
+                frame.image,
+                anomaly_classes,
+                prefix=f"{frame.frame_id}_global"
+            )
+
+        def run_sam3_tiles():
+            return self._segmenter.segment_tiles_with_text(
+                frame.image,
+                anomaly_classes,
+                grid_cols=grid_config.cols,
+                grid_rows=grid_config.rows,
+                prefix=f"{frame.frame_id}_tile"
+            )
+
+        # Run SAM3 (both global and tiles) while VLM API call is in flight
+        # Note: SAM3 global and tiles share GPU, so run sequentially on GPU
+        # but VLM is pure network I/O, so can overlap with SAM3
+        import concurrent.futures
+
+        loop = asyncio.get_event_loop()
+
+        # Create VLM task (async - network I/O)
+        vlm_task = asyncio.create_task(
+            self._vlm_judge.process_frame(
+                frame.image,
+                frame.frame_id,
+                frame.frame_index,
+            )
         )
-        result.vlm_time_ms = (time.perf_counter() - vlm_start) * 1000
 
+        # Run SAM3 operations in thread pool (GPU compute)
+        # These will run while VLM is waiting for network response
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            sam_global_future = loop.run_in_executor(executor, run_sam3_global)
+            global_results = await sam_global_future
+
+            sam_tiles_future = loop.run_in_executor(executor, run_sam3_tiles)
+            tile_results = await sam_tiles_future
+
+        # Now await VLM response (may already be done)
+        vlm_response = await vlm_task
+
+        concurrent_time = (time.perf_counter() - concurrent_start) * 1000
+        logger.info(
+            f"[Frame {frame.frame_index}] Concurrent phase complete in {concurrent_time:.0f}ms: "
+            f"global={len(global_results)}, tiles={len(tile_results)}, "
+            f"vlm={len(vlm_response.predictions) if vlm_response else 0}"
+        )
+
+        # Store VLM timing
         if vlm_response:
+            result.vlm_time_ms = vlm_response.generation_time_ms
             result.vlm_response = vlm_response
-            logger.info(f"[Frame {frame.frame_index}] VLM: {len(vlm_response.predictions)} predictions in {result.vlm_time_ms:.0f}ms")
 
             if vlm_response.error_message:
                 logger.warning(f"[Frame {frame.frame_index}] VLM error: {vlm_response.error_message}")
