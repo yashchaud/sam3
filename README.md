@@ -55,8 +55,8 @@ git clone <repo-url>
 cd anomalyDetection
 pip install -e ".[all]"
 
-# Install SAM2 separately (requires Git)
-pip install git+https://github.com/facebookresearch/sam2.git
+# Install SAM3 separately (requires Git)
+pip install git+https://github.com/facebookresearch/sam3.git
 ```
 
 ## Quick Start
@@ -71,7 +71,7 @@ from anomaly_detection.utils import load_image
 
 async def main():
     config = RealtimeConfig(
-        segmenter_model_path=Path("weights/sam2_hiera_large.pt"),
+        segmenter_model_path=Path("weights/sam3_hiera_large.pt"),
         enable_vlm_judge=True,
     )
 
@@ -96,7 +96,7 @@ async def main():
     config = RealtimeConfig(
         source_type=FrameSource.VIDEO_FILE,
         source_path="inspection.mp4",
-        segmenter_model_path=Path("weights/sam2_hiera_large.pt"),
+        segmenter_model_path=Path("weights/sam3_hiera_large.pt"),
         enable_vlm_judge=True,
         vlm_process_every_n_frames=10,
     )
@@ -121,7 +121,7 @@ vlm_config = VLMConfig(
 )
 
 config = RealtimeConfig(
-    segmenter_model_path=Path("weights/sam2.pt"),
+    segmenter_model_path=Path("weights/sam3.pt"),
     enable_vlm_judge=True,
     vlm_config=vlm_config,
 )
@@ -132,21 +132,21 @@ config = RealtimeConfig(
 ```bash
 # Single image
 python -m examples.run_single_image image.jpg \
-    --sam-model weights/sam2.pt \
+    --sam-model weights/sam3.pt \
     --enable-vlm \
     --output result.jpg
 
 # Video processing
 python -m examples.run_realtime_video \
     --source video.mp4 \
-    --sam-model weights/sam2.pt \
+    --sam-model weights/sam3.pt \
     --enable-vlm \
     --vlm-every-n 10
 
 # Webcam
 python -m examples.run_realtime_video \
     --webcam 0 \
-    --sam-model weights/sam2.pt
+    --sam-model weights/sam3.pt
 ```
 
 ## VLM Judge System
@@ -268,5 +268,5 @@ MIT License - See LICENSE file for details.
 
 Model licenses:
 - RF-DETR: Apache 2.0
-- SAM2: Apache 2.0
+- SAM3: Apache 2.0
 - Qwen: Various (check model card)

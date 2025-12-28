@@ -54,15 +54,9 @@ class SAM3Segmenter:
             else:
                 self._device = self.config.device
 
-            # Try SAM3 first, fallback to SAM2
-            try:
-                from sam3.build_sam import build_sam3
-                from sam3.sam3_image_predictor import SAM3ImagePredictor
-                use_sam3 = True
-            except ImportError:
-                from sam2.build_sam import build_sam2 as build_sam3
-                from sam2.sam2_image_predictor import SAM2ImagePredictor as SAM3ImagePredictor
-                use_sam3 = False
+            # Import SAM3 modules
+            from sam3.build_sam import build_sam3
+            from sam3.sam3_image_predictor import SAM3ImagePredictor
 
             # Load model
             if self.config.model_path and self.config.model_path.exists():
@@ -70,51 +64,33 @@ class SAM3Segmenter:
                 checkpoint_lower = checkpoint.lower()
 
                 # Determine config from checkpoint name
-                if use_sam3:
-                    if "large" in checkpoint_lower:
-                        model_cfg = "sam3_hiera_l.yaml"
-                    elif "base" in checkpoint_lower:
-                        model_cfg = "sam3_hiera_b+.yaml"
-                    elif "small" in checkpoint_lower:
-                        model_cfg = "sam3_hiera_s.yaml"
-                    elif "tiny" in checkpoint_lower:
-                        model_cfg = "sam3_hiera_t.yaml"
-                    else:
-                        model_cfg = "sam3_hiera_l.yaml"
+                if "large" in checkpoint_lower:
+                    model_cfg = "sam3_hiera_l.yaml"
+                elif "base" in checkpoint_lower:
+                    model_cfg = "sam3_hiera_b+.yaml"
+                elif "small" in checkpoint_lower:
+                    model_cfg = "sam3_hiera_s.yaml"
+                elif "tiny" in checkpoint_lower:
+                    model_cfg = "sam3_hiera_t.yaml"
                 else:
-                    if "large" in checkpoint_lower:
-                        model_cfg = "sam2_hiera_l.yaml"
-                    elif "base" in checkpoint_lower:
-                        model_cfg = "sam2_hiera_b+.yaml"
-                    elif "small" in checkpoint_lower:
-                        model_cfg = "sam2_hiera_s.yaml"
-                    elif "tiny" in checkpoint_lower:
-                        model_cfg = "sam2_hiera_t.yaml"
-                    else:
-                        model_cfg = "sam2_hiera_l.yaml"
+                    # Default: use base config for generic sam3.pt file
+                    model_cfg = "sam3_hiera_l.yaml"
 
                 self._model = build_sam3(model_cfg, checkpoint, device=self._device)
             else:
                 # Try to load from HuggingFace
-                if use_sam3:
-                    from sam3.build_sam import build_sam3_hf
-                    self._model = build_sam3_hf(
-                        "facebook/sam3-hiera-large",
-                        device=self._device,
-                    )
-                else:
-                    from sam2.build_sam import build_sam2_hf
-                    self._model = build_sam2_hf(
-                        "facebook/sam2-hiera-large",
-                        device=self._device,
-                    )
+                from sam3.build_sam import build_sam3_hf
+                self._model = build_sam3_hf(
+                    "facebook/sam3-hiera-large",
+                    device=self._device,
+                )
 
             self._predictor = SAM3ImagePredictor(self._model)
             self._is_loaded = True
 
         except ImportError as e:
             raise ImportError(
-                f"SAM3/SAM2 not installed. Install from: https://github.com/facebookresearch/sam3. Error: {e}"
+                f"SAM3 not installed. Install: pip install git+https://github.com/facebookresearch/sam3.git\nError: {e}"
             )
 
     def unload(self) -> None:

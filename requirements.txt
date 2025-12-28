@@ -10,8 +10,8 @@ torchvision>=0.20.0
 # Detection - RF-DETR (Apache 2.0)
 rfdetr>=1.2.0
 
-# Segmentation - SAM2/SAM3 (install from GitHub)
-# pip install git+https://github.com/facebookresearch/sam2.git
+# Segmentation - SAM3 (install from GitHub)
+# pip install git+https://github.com/facebookresearch/sam3.git
 timm>=0.9.0
 einops>=0.7.0
 huggingface_hub>=0.20.0
