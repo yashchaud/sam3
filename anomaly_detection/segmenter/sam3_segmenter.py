@@ -58,21 +58,14 @@ class SAM3Segmenter:
             from transformers import Sam3Model, Sam3Processor
             import torch
 
-            # Load model from HuggingFace
-            if self.config.model_path and self.config.model_path.exists():
-                # Load local checkpoint
-                self._model = Sam3Model.from_pretrained(
-                    str(self.config.model_path.parent),
-                    local_files_only=True
-                ).to(self._device)
-                self._processor = Sam3Processor.from_pretrained(
-                    str(self.config.model_path.parent),
-                    local_files_only=True
-                )
-            else:
-                # Load from HuggingFace Hub
-                self._model = Sam3Model.from_pretrained("facebook/sam3").to(self._device)
-                self._processor = Sam3Processor.from_pretrained("facebook/sam3")
+            # Load model from HuggingFace Hub
+            # SAM3 is always loaded from HuggingFace, transformers handles caching automatically
+            model_kwargs = {}
+            if self.config.hf_token:
+                model_kwargs["token"] = self.config.hf_token
+
+            self._model = Sam3Model.from_pretrained("facebook/sam3", **model_kwargs).to(self._device)
+            self._processor = Sam3Processor.from_pretrained("facebook/sam3", **model_kwargs)
 
             self._predictor = self._processor  # For compatibility
             self._is_loaded = True

@@ -25,8 +25,9 @@ class RealtimeConfig:
     source_path: str | None = None
     webcam_id: int = 0
 
-    # Model paths
-    segmenter_model_path: Path | None = None
+    # Model paths and authentication
+    segmenter_model_path: Path | None = None  # Deprecated - SAM3 loads from HuggingFace
+    hf_token: str | None = None  # HuggingFace token for gated models
 
     # VLM configuration (primary detection method)
     vlm_config: VLMConfig = field(default_factory=VLMConfig)
@@ -56,11 +57,10 @@ class RealtimeConfig:
 
     def get_segmenter_config(self) -> SegmenterConfig:
         """Build segmenter configuration."""
-        if self.segmenter_model_path is None:
-            raise ValueError("segmenter_model_path is required")
         return SegmenterConfig(
-            model_path=self.segmenter_model_path,
+            model_path=self.segmenter_model_path,  # Optional - SAM3 loads from HF Hub
             device=self.device,
+            hf_token=self.hf_token,
         )
 
     def get_vlm_config(self) -> VLMConfig:

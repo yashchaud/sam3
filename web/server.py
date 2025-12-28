@@ -64,7 +64,7 @@ async def lifespan(app: FastAPI):
 
             # Build main config
             config = RealtimeConfig(
-                segmenter_model_path=env_config.sam3_model_path,
+                hf_token=env_config.hf_token,
                 vlm_config=vlm_config,
                 confidence_threshold=env_config.confidence_threshold,
                 device=env_config.device,
@@ -77,7 +77,7 @@ async def lifespan(app: FastAPI):
             state.processor.load()
 
             logger.info("Models loaded successfully!")
-            logger.info(f"  SAM3: {env_config.sam3_model_path}")
+            logger.info(f"  SAM3: facebook/sam3 (HuggingFace)")
             logger.info(f"  VLM: {env_config.openrouter_model}")
 
     except Exception as e:
@@ -169,7 +169,8 @@ async def get_current_config():
     env_config = get_config()
     models_loaded = state.processor is not None and state.processor.is_loaded()
     return {
-        "sam3_model_path": str(env_config.sam3_model_path) if env_config.sam3_model_path else None,
+        "sam3_model": "facebook/sam3 (HuggingFace)",
+        "hf_token_set": bool(env_config.hf_token),
         "openrouter_model": env_config.openrouter_model,
         "openrouter_api_key_set": bool(env_config.openrouter_api_key),
         "vlm_every_n_frames": env_config.vlm_every_n_frames,
@@ -205,7 +206,7 @@ async def load_models():
 
         # Build main config (VLM + SAM3 pipeline)
         state.config = RealtimeConfig(
-            segmenter_model_path=env_config.sam3_model_path,
+            hf_token=env_config.hf_token,
             vlm_config=vlm_config,
             confidence_threshold=env_config.confidence_threshold,
             device=env_config.device,
@@ -217,13 +218,13 @@ async def load_models():
         state.processor = RealtimeVideoProcessor(state.config)
         state.processor.load()
 
-        logger.info(f"Models loaded - SAM3: {env_config.sam3_model_path}, VLM: {env_config.openrouter_model}")
+        logger.info(f"Models loaded - SAM3: facebook/sam3 (HuggingFace), VLM: {env_config.openrouter_model}")
 
         return {
             "status": "ok",
             "message": "Models loaded",
             "config": {
-                "sam3_model": str(env_config.sam3_model_path),
+                "sam3_model": "facebook/sam3 (HuggingFace)",
                 "vlm_model": env_config.openrouter_model,
                 "device": env_config.device,
             }

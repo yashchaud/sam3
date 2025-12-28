@@ -50,8 +50,8 @@ class EnvironmentConfig:
 
     Pipeline: VLM (OpenRouter) -> SAM3 Segmentation
     """
-    # SAM3 model path (required)
-    sam3_model_path: Path | None = None
+    # HuggingFace token (optional)
+    hf_token: str | None = None
 
     # Device
     device: str = "auto"
@@ -86,12 +86,11 @@ class EnvironmentConfig:
         except ImportError:
             pass
 
-        sam3_path = os.environ.get("SAM3_MODEL_PATH")
         mask_dir = os.environ.get("ANOMALY_MASK_OUTPUT_DIR")
 
         return cls(
-            # SAM3 model path
-            sam3_model_path=Path(sam3_path) if sam3_path else None,
+            # HuggingFace token
+            hf_token=os.environ.get("HF_TOKEN"),
 
             # Device
             device=os.environ.get("ANOMALY_DEVICE", "auto"),
@@ -121,10 +120,7 @@ class EnvironmentConfig:
         """Validate configuration and return list of errors."""
         errors = []
 
-        if not self.sam3_model_path:
-            errors.append("SAM3_MODEL_PATH is required")
-        elif not self.sam3_model_path.exists():
-            errors.append(f"SAM3 model not found: {self.sam3_model_path}")
+        # SAM3 loads from HuggingFace Hub automatically, no path needed
 
         if not self.openrouter_api_key:
             errors.append("OPENROUTER_API_KEY is required")
@@ -139,7 +135,8 @@ class EnvironmentConfig:
         print("\n" + "=" * 60)
         print("Anomaly Detection Pipeline (VLM + SAM3)")
         print("=" * 60)
-        print(f"  SAM3 Model:       {self.sam3_model_path or 'Not set'}")
+        print(f"  SAM3 Model:       facebook/sam3 (HuggingFace)")
+        print(f"  HF Token:         {'***' + self.hf_token[-4:] if self.hf_token else 'Not set'}")
         print(f"  Device:           {self.device}")
         print(f"  Confidence:       {self.confidence_threshold}")
         print()
