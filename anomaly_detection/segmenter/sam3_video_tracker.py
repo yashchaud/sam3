@@ -51,6 +51,14 @@ class SAM3VideoTracker:
             return
 
         try:
+            import torch
+
+            # Determine device (resolve "auto" to actual device)
+            if self.config.device == "auto":
+                self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            else:
+                self._device = self.config.device
+
             logger.info(f"Loading SAM3 Tracker model on device: {self._device}")
 
             from transformers import Sam3TrackerModel, Sam3Processor
