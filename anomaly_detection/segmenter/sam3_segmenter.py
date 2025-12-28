@@ -152,8 +152,9 @@ class SAM3Segmenter:
 
         # Build model
         self._model = build_sam3_image_model(
-            checkpoint=str(self.config.model_path),
+            checkpoint_path=str(self.config.model_path),
             device=self._device,
+            load_from_HF=False,  # Use local checkpoint, don't download from HF
         )
         self._processor = Sam3Processor(self._model)
 
