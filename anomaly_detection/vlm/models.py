@@ -47,7 +47,7 @@ class VLMConfig:
 
     # OpenRouter config
     openrouter_api_key: str | None = None
-    openrouter_model: str = "qwen/qwen-2.5-vl-72b-instruct"
+    openrouter_model: str = "bytedance-seed/seed-1.6-flash"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # Processing config

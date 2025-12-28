@@ -47,8 +47,6 @@ class SAM3Segmenter:
 
         try:
             import torch
-            from sam2.build_sam import build_sam2
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
 
             # Determine device
             if self.config.device == "auto":
@@ -56,37 +54,67 @@ class SAM3Segmenter:
             else:
                 self._device = self.config.device
 
+            # Try SAM3 first, fallback to SAM2
+            try:
+                from sam3.build_sam import build_sam3
+                from sam3.sam3_image_predictor import SAM3ImagePredictor
+                use_sam3 = True
+            except ImportError:
+                from sam2.build_sam import build_sam2 as build_sam3
+                from sam2.sam2_image_predictor import SAM2ImagePredictor as SAM3ImagePredictor
+                use_sam3 = False
+
             # Load model
             if self.config.model_path and self.config.model_path.exists():
                 checkpoint = str(self.config.model_path)
-                # Try to determine config from checkpoint name
-                if "large" in checkpoint.lower():
-                    model_cfg = "sam2_hiera_l.yaml"
-                elif "base" in checkpoint.lower():
-                    model_cfg = "sam2_hiera_b+.yaml"
-                elif "small" in checkpoint.lower():
-                    model_cfg = "sam2_hiera_s.yaml"
-                elif "tiny" in checkpoint.lower():
-                    model_cfg = "sam2_hiera_t.yaml"
-                else:
-                    model_cfg = "sam2_hiera_l.yaml"  # Default
+                checkpoint_lower = checkpoint.lower()
 
-                self._model = build_sam2(model_cfg, checkpoint, device=self._device)
+                # Determine config from checkpoint name
+                if use_sam3:
+                    if "large" in checkpoint_lower:
+                        model_cfg = "sam3_hiera_l.yaml"
+                    elif "base" in checkpoint_lower:
+                        model_cfg = "sam3_hiera_b+.yaml"
+                    elif "small" in checkpoint_lower:
+                        model_cfg = "sam3_hiera_s.yaml"
+                    elif "tiny" in checkpoint_lower:
+                        model_cfg = "sam3_hiera_t.yaml"
+                    else:
+                        model_cfg = "sam3_hiera_l.yaml"
+                else:
+                    if "large" in checkpoint_lower:
+                        model_cfg = "sam2_hiera_l.yaml"
+                    elif "base" in checkpoint_lower:
+                        model_cfg = "sam2_hiera_b+.yaml"
+                    elif "small" in checkpoint_lower:
+                        model_cfg = "sam2_hiera_s.yaml"
+                    elif "tiny" in checkpoint_lower:
+                        model_cfg = "sam2_hiera_t.yaml"
+                    else:
+                        model_cfg = "sam2_hiera_l.yaml"
+
+                self._model = build_sam3(model_cfg, checkpoint, device=self._device)
             else:
                 # Try to load from HuggingFace
-                from sam2.build_sam import build_sam2_hf
+                if use_sam3:
+                    from sam3.build_sam import build_sam3_hf
+                    self._model = build_sam3_hf(
+                        "facebook/sam3-hiera-large",
+                        device=self._device,
+                    )
+                else:
+                    from sam2.build_sam import build_sam2_hf
+                    self._model = build_sam2_hf(
+                        "facebook/sam2-hiera-large",
+                        device=self._device,
+                    )
 
-                self._model = build_sam2_hf(
-                    "facebook/sam2-hiera-large",
-                    device=self._device,
-                )
-
-            self._predictor = SAM2ImagePredictor(self._model)
+            self._predictor = SAM3ImagePredictor(self._model)
             self._is_loaded = True
 
         except ImportError as e:
             raise ImportError(
-                f"SAM2 not installed. Install from: https://github.com/facebookresearch/sam2. Error: {e}"
+                f"SAM3/SAM2 not installed. Install from: https://github.com/facebookresearch/sam3. Error: {e}"
             )
 
     def unload(self) -> None:

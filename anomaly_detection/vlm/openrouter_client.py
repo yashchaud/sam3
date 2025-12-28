@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import logging
 import numpy as np
 import json
 import re
@@ -11,6 +12,8 @@ import aiohttp
 
 from .base_client import BaseVLMClient
 from .models import VLMConfig, VLMPrediction, VLMResponse, VLMProvider, PredictionType
+
+logger = logging.getLogger(__name__)
 
 
 class OpenRouterClient(BaseVLMClient):
@@ -154,8 +157,13 @@ class OpenRouterClient(BaseVLMClient):
                 message = data["choices"][0].get("message", {})
                 response_text = message.get("content", "")
 
+            # Log raw VLM response
+            logger.info(f"[OpenRouter] Model: {self.config.openrouter_model}")
+            logger.info(f"[OpenRouter] Raw response: {response_text[:500]}{'...' if len(response_text) > 500 else ''}")
+
             # Parse predictions
             predictions = self._parse_predictions(response_text)
+            logger.info(f"[OpenRouter] Parsed {len(predictions)} predictions from response")
 
             return VLMResponse(
                 frame_id=frame_id,

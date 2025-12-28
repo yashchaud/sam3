@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import logging
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -14,12 +15,12 @@ from .frame_buffer import FrameBuffer, BufferedFrame
 from .stream_handler import StreamHandler, StreamState
 
 from ..vlm import VLMJudge, VLMConfig, VLMResponse, VLMPrediction, PredictionType
-from ..detector import RFDETRDetector, DetectorConfig
 from ..segmenter import SAM3Segmenter, SegmenterConfig
 from ..models import Detection, AnomalyResult, PipelineOutput, BoundingBox, SegmentationMask
-from ..tiling import TiledDetectionCoordinator, TileConfig
-from ..association import StructureDefectMatcher
 from ..geometry import MaskGeometryExtractor
+
+# Setup logger for VLM predictions
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -70,25 +71,19 @@ class RealtimeVideoProcessor:
 
     Pipeline:
     1. Stream frames from video/webcam/RTSP
-    2. Run RF-DETR detection on each frame
-    3. Run SAM3 segmentation on detected anomalies
-    4. Every N frames, send to VLM for additional guidance
-    5. VLM predictions are processed async and merged when ready
-    6. Stale VLM predictions (>60 frames old) are discarded
+    2. Every N frames, send to VLM (OpenRouter) for anomaly detection
+    3. VLM outputs structured coordinates for detected defects
+    4. Run SAM3 segmentation on VLM-predicted coordinates
+    5. Stale VLM predictions (>60 frames old) are discarded
     """
 
     def __init__(self, config: RealtimeConfig):
         self.config = config
 
-        # Initialize components
-        self._detector: RFDETRDetector | None = None
+        # Initialize components (VLM + SAM3 only, no RF-DETR)
         self._segmenter: SAM3Segmenter | None = None
         self._vlm_judge: VLMJudge | None = None
-        self._matcher = StructureDefectMatcher()
         self._geometry = MaskGeometryExtractor()
-
-        # Tiling coordinator for large frames
-        self._tiled_coordinator: TiledDetectionCoordinator | None = None
 
         # Stream handling
         self._stream: StreamHandler | None = None
@@ -114,29 +109,17 @@ class RealtimeVideoProcessor:
         if self._is_loaded:
             return
 
-        # Initialize detector
-        detector_config = self.config.get_detector_config()
-        self._detector = RFDETRDetector(detector_config)
-        self._detector.load()
-
-        # Initialize segmenter
+        # Initialize segmenter (SAM3)
         segmenter_config = self.config.get_segmenter_config()
         self._segmenter = SAM3Segmenter(segmenter_config)
         self._segmenter.load()
+        logger.info("SAM3 segmenter loaded")
 
-        # Initialize tiled coordinator if needed
-        if self.config.enable_tiling:
-            self._tiled_coordinator = TiledDetectionCoordinator(
-                detector=self._detector,
-                segmenter=self._segmenter,
-                tile_config=self.config.tile_config,
-            )
-
-        # Initialize VLM judge if enabled
-        if self.config.enable_vlm_judge:
-            vlm_config = self.config.get_vlm_config()
-            self._vlm_judge = VLMJudge(vlm_config)
-            self._vlm_judge.load()
+        # Initialize VLM judge (required for this pipeline)
+        vlm_config = self.config.get_vlm_config()
+        self._vlm_judge = VLMJudge(vlm_config)
+        self._vlm_judge.load()
+        logger.info(f"VLM Judge loaded (provider: {vlm_config.provider.value}, model: {vlm_config.openrouter_model})")
 
         self._is_loaded = True
 
@@ -150,11 +133,6 @@ class RealtimeVideoProcessor:
             self._segmenter.unload()
             self._segmenter = None
 
-        if self._detector:
-            self._detector.unload()
-            self._detector = None
-
-        self._tiled_coordinator = None
         self._is_loaded = False
 
     def is_loaded(self) -> bool:
@@ -250,7 +228,7 @@ class RealtimeVideoProcessor:
         return result
 
     async def _process_frame(self, frame: BufferedFrame) -> FrameResult:
-        """Process a single buffered frame."""
+        """Process a single buffered frame using VLM + SAM3 pipeline."""
         start_time = time.perf_counter()
 
         # Initialize result
@@ -260,116 +238,64 @@ class RealtimeVideoProcessor:
             timestamp=frame.timestamp,
         )
 
-        # Step 1: Run detection
-        detection_start = time.perf_counter()
-        detections = self._run_detection(frame.image)
-        result.detection_time_ms = (time.perf_counter() - detection_start) * 1000
-
-        # Separate structures and anomalies
-        structures = [d for d in detections if d.detection_type.value == "structure"]
-        anomalies = [d for d in detections if d.detection_type.value == "anomaly"]
-        result.structures = structures
-
-        # Step 2: Run segmentation on anomalies
-        seg_start = time.perf_counter()
-        segmented_anomalies = self._run_segmentation(frame.image, anomalies, structures)
-        result.segmentation_time_ms = (time.perf_counter() - seg_start) * 1000
-        result.anomalies = segmented_anomalies
-
-        # Step 3: Check for VLM-guided predictions
+        # Step 1: Check for ready VLM predictions and process them
         vlm_start = time.perf_counter()
-        if self._vlm_judge and self.config.enable_vlm_judge:
-            # Get any ready VLM predictions
-            ready_predictions = await self._vlm_judge.get_ready_predictions(
-                frame.frame_index
+
+        # Get any ready VLM predictions from previous async requests
+        ready_predictions = await self._vlm_judge.get_ready_predictions(
+            frame.frame_index
+        )
+
+        for response in ready_predictions:
+            result.vlm_response = response
+            self._stats.total_vlm_predictions += len(response.predictions)
+
+            # Log VLM predictions
+            if response.predictions:
+                logger.info(
+                    f"[Frame {frame.frame_index}] VLM returned {len(response.predictions)} predictions "
+                    f"(latency: {response.generation_time_ms:.0f}ms)"
+                )
+                for pred in response.predictions:
+                    if pred.box:
+                        logger.info(
+                            f"  -> Defect: {pred.defect_type}, confidence: {pred.confidence:.2f}, "
+                            f"box: [{pred.box[0]}, {pred.box[1]}, {pred.box[2]}, {pred.box[3]}]"
+                        )
+                    elif pred.point:
+                        logger.info(
+                            f"  -> Defect: {pred.defect_type}, confidence: {pred.confidence:.2f}, "
+                            f"point: ({pred.point[0]}, {pred.point[1]})"
+                        )
+                    elif pred.grid_cell:
+                        logger.info(
+                            f"  -> Defect: {pred.defect_type}, confidence: {pred.confidence:.2f}, "
+                            f"grid_cell: {pred.grid_cell}"
+                        )
+
+            # Step 2: Run SAM3 segmentation on VLM predictions
+            seg_start = time.perf_counter()
+            vlm_anomalies = await self._process_vlm_predictions(
+                frame.image,
+                response.predictions,
+                frame.frame_id,
             )
+            result.segmentation_time_ms = (time.perf_counter() - seg_start) * 1000
+            result.vlm_guided_anomalies.extend(vlm_anomalies)
 
-            for response in ready_predictions:
-                result.vlm_response = response
-                self._stats.total_vlm_predictions += len(response.predictions)
-
-                # Process VLM predictions
-                vlm_anomalies = await self._process_vlm_predictions(
-                    frame.image,
-                    response.predictions,
-                    frame.frame_id,
-                )
-                result.vlm_guided_anomalies.extend(vlm_anomalies)
-
-            # Submit new frame for VLM processing if appropriate
-            if self._vlm_judge.should_process_frame(frame.frame_index):
-                await self._vlm_judge.submit_frame_async(
-                    frame.image,
-                    frame.frame_id,
-                    frame.frame_index,
-                )
+        # Submit new frame for VLM processing if appropriate
+        if self._vlm_judge.should_process_frame(frame.frame_index):
+            logger.debug(f"[Frame {frame.frame_index}] Submitting frame to VLM for analysis")
+            await self._vlm_judge.submit_frame_async(
+                frame.image,
+                frame.frame_id,
+                frame.frame_index,
+            )
 
         result.vlm_time_ms = (time.perf_counter() - vlm_start) * 1000
         result.total_time_ms = (time.perf_counter() - start_time) * 1000
 
         return result
-
-    def _run_detection(self, image: np.ndarray) -> list[Detection]:
-        """Run object detection on image."""
-        if self._tiled_coordinator and self.config.enable_tiling:
-            # Use tiled detection for large images
-            tiled_results = self._tiled_coordinator.detect_only(image)
-            return [r.detection for r in tiled_results]
-        else:
-            # Direct detection
-            output = self._detector.detect(image)
-            return output.detections
-
-    def _run_segmentation(
-        self,
-        image: np.ndarray,
-        anomalies: list[Detection],
-        structures: list[Detection],
-    ) -> list[AnomalyResult]:
-        """Run segmentation on detected anomalies."""
-        if not anomalies:
-            return []
-
-        results = []
-
-        # Set image for batch processing
-        self._segmenter.set_image(image)
-
-        try:
-            for detection in anomalies:
-                # Segment this detection
-                seg_result = self._segmenter.segment_detection(detection)
-
-                if not seg_result.success or seg_result.mask is None:
-                    continue
-
-                # Extract geometry
-                geometry = self._geometry.extract(seg_result.mask.data)
-
-                # Match to structure
-                match_results = self._matcher.match([detection], structures)
-                match = match_results[0] if match_results else None
-
-                # Build anomaly result
-                anomaly = AnomalyResult(
-                    anomaly_id=detection.detection_id,
-                    frame_id="",  # Will be set by caller
-                    timestamp=time.time(),
-                    defect_type=detection.class_name,
-                    structure_type=match.structure_class if match else None,
-                    bbox=detection.bbox,
-                    mask=seg_result.mask,
-                    geometry=geometry,
-                    detection_confidence=detection.confidence,
-                    segmentation_confidence=seg_result.mask.sam_score or 0.0,
-                    association_confidence=match.confidence if match else 0.0,
-                )
-                results.append(anomaly)
-
-        finally:
-            self._segmenter.clear_image()
-
-        return results
 
     async def _process_vlm_predictions(
         self,

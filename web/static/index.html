@@ -615,6 +615,10 @@
             };
 
             ws.onmessage = (event) => {
+                // Ignore pong responses (plain text, not JSON)
+                if (event.data === "pong") {
+                    return;
+                }
                 const data = JSON.parse(event.data);
                 handleMessage(data);
             };

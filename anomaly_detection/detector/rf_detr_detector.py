@@ -83,13 +83,10 @@ class RFDETRDetector:
 
             if self.config.pretrain_weights:
                 # Load custom weights
-                self._model = RFDETRBase.from_pretrained(
-                    str(self.config.pretrain_weights),
-                    num_classes=self.config.num_classes,
-                )
+                self._model = RFDETRBase(pretrain_weights=str(self.config.pretrain_weights))
             else:
-                # Load pretrained
-                self._model = RFDETRBase.from_pretrained(model_name)
+                # Load pretrained COCO model
+                self._model = RFDETRBase()
 
             self._model = self._model.to(self._device)
             self._model.eval()

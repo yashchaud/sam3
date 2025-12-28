@@ -5,9 +5,7 @@ from enum import Enum
 from pathlib import Path
 
 from ..vlm.models import VLMConfig, VLMProvider, GridConfig
-from ..detector.rf_detr_detector import RFDETRVariant, DetectorConfig
 from ..segmenter.sam3_segmenter import SegmenterConfig
-from ..tiling.tiler import TileConfig
 
 
 class FrameSource(Enum):
@@ -20,7 +18,7 @@ class FrameSource(Enum):
 
 @dataclass
 class RealtimeConfig:
-    """Configuration for real-time video processing pipeline."""
+    """Configuration for real-time video processing pipeline (VLM + SAM3)."""
 
     # Source configuration
     source_type: FrameSource = FrameSource.VIDEO_FILE
@@ -29,12 +27,8 @@ class RealtimeConfig:
 
     # Model paths
     segmenter_model_path: Path | None = None
-    detector_weights: Path | None = None
-    detector_variant: RFDETRVariant = RFDETRVariant.MEDIUM
-    detector_num_classes: int | None = None
 
-    # VLM configuration
-    enable_vlm_judge: bool = True
+    # VLM configuration (primary detection method)
     vlm_config: VLMConfig = field(default_factory=VLMConfig)
 
     # Processing configuration
@@ -46,10 +40,6 @@ class RealtimeConfig:
     # Buffer configuration
     frame_buffer_size: int = 120  # 4 seconds at 30fps
     max_pending_vlm_requests: int = 3
-
-    # Tiling configuration
-    enable_tiling: bool = True
-    tile_config: TileConfig = field(default_factory=TileConfig)
 
     # Output configuration
     save_masks: bool = False
@@ -63,16 +53,6 @@ class RealtimeConfig:
     # Performance tuning
     skip_frames_on_lag: bool = True
     max_processing_backlog: int = 5
-
-    def get_detector_config(self) -> DetectorConfig:
-        """Build detector configuration."""
-        return DetectorConfig(
-            variant=self.detector_variant,
-            pretrain_weights=self.detector_weights,
-            num_classes=self.detector_num_classes,
-            confidence_threshold=self.confidence_threshold,
-            device=self.device,
-        )
 
     def get_segmenter_config(self) -> SegmenterConfig:
         """Build segmenter configuration."""
