@@ -54,38 +54,27 @@ class SAM3Segmenter:
             else:
                 self._device = self.config.device
 
-            # Import SAM3 modules
-            from sam3.build_sam import build_sam3
-            from sam3.sam3_image_predictor import SAM3ImagePredictor
+            # Import SAM3 modules (Transformers implementation)
+            from transformers import Sam3Model, Sam3Processor
+            import torch
 
-            # Load model
+            # Load model from HuggingFace
             if self.config.model_path and self.config.model_path.exists():
-                checkpoint = str(self.config.model_path)
-                checkpoint_lower = checkpoint.lower()
-
-                # Determine config from checkpoint name
-                if "large" in checkpoint_lower:
-                    model_cfg = "sam3_hiera_l.yaml"
-                elif "base" in checkpoint_lower:
-                    model_cfg = "sam3_hiera_b+.yaml"
-                elif "small" in checkpoint_lower:
-                    model_cfg = "sam3_hiera_s.yaml"
-                elif "tiny" in checkpoint_lower:
-                    model_cfg = "sam3_hiera_t.yaml"
-                else:
-                    # Default: use base config for generic sam3.pt file
-                    model_cfg = "sam3_hiera_l.yaml"
-
-                self._model = build_sam3(model_cfg, checkpoint, device=self._device)
-            else:
-                # Try to load from HuggingFace
-                from sam3.build_sam import build_sam3_hf
-                self._model = build_sam3_hf(
-                    "facebook/sam3-hiera-large",
-                    device=self._device,
+                # Load local checkpoint
+                self._model = Sam3Model.from_pretrained(
+                    str(self.config.model_path.parent),
+                    local_files_only=True
+                ).to(self._device)
+                self._processor = Sam3Processor.from_pretrained(
+                    str(self.config.model_path.parent),
+                    local_files_only=True
                 )
+            else:
+                # Load from HuggingFace Hub
+                self._model = Sam3Model.from_pretrained("facebook/sam3").to(self._device)
+                self._processor = Sam3Processor.from_pretrained("facebook/sam3")
 
-            self._predictor = SAM3ImagePredictor(self._model)
+            self._predictor = self._processor  # For compatibility
             self._is_loaded = True
 
         except ImportError as e:
@@ -121,22 +110,21 @@ class SAM3Segmenter:
         """
         Set the current image for segmentation.
 
-        This pre-computes image embeddings for efficient multi-detection processing.
-
         Args:
             image: RGB image (H, W, 3)
         """
         if not self.is_loaded():
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        self._current_image = image
-        self._predictor.set_image(image)
+        from PIL import Image
+        # Convert numpy to PIL Image
+        if image.dtype != np.uint8:
+            image = (image * 255).astype(np.uint8)
+        self._current_image = Image.fromarray(image)
 
     def clear_image(self) -> None:
-        """Clear the current image and embeddings."""
+        """Clear the current image."""
         self._current_image = None
-        if self._predictor is not None:
-            self._predictor.reset_predictor()
 
     def segment_detection(
         self,
@@ -175,22 +163,39 @@ class SAM3Segmenter:
 
             import torch
 
-            # Prepare box prompt
-            bbox = detection.bbox
-            input_box = np.array([bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max])
+            # Use defect type as text prompt for SAM3
+            text_prompt = detection.class_name if hasattr(detection, 'class_name') else "anomaly"
+
+            # Prepare inputs for SAM3
+            inputs = self._processor(
+                images=self._current_image,
+                text=text_prompt,
+                return_tensors="pt"
+            ).to(self._device)
 
             # Run prediction
-            masks, scores, _ = self._predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=input_box,
-                multimask_output=True,
-            )
+            with torch.no_grad():
+                outputs = self._model(**inputs)
 
-            # Select best mask
-            best_idx = np.argmax(scores)
-            mask_data = masks[best_idx]
-            sam_score = float(scores[best_idx])
+            # Post-process results
+            results = self._processor.post_process_instance_segmentation(
+                outputs,
+                threshold=self.config.mask_threshold,
+                mask_threshold=self.config.mask_threshold,
+                target_sizes=inputs.get("original_sizes").tolist()
+            )[0]
+
+            if len(results['masks']) == 0:
+                return SegmentationResult(
+                    detection_id=detection.detection_id,
+                    mask=None,
+                    success=False,
+                    error_message="No mask generated",
+                )
+
+            # Get the first/best mask
+            mask_data = results['masks'][0].cpu().numpy()
+            sam_score = float(results['scores'][0].cpu().numpy()) if len(results['scores']) > 0 else 1.0
 
             # Convert to binary
             mask_binary = (mask_data > self.config.mask_threshold).astype(np.uint8)
@@ -268,23 +273,41 @@ class SAM3Segmenter:
 
         try:
             self.set_image(image)
+            import torch
+
+            # SAM3 uses text prompts, use generic "object" for point-based segmentation
+            text_prompt = "object"
 
             # Prepare inputs
-            input_points = np.array(points)
-            input_labels = np.array(labels if labels else [1] * len(points))
+            inputs = self._processor(
+                images=self._current_image,
+                text=text_prompt,
+                return_tensors="pt"
+            ).to(self._device)
 
             # Run prediction
-            masks, scores, _ = self._predictor.predict(
-                point_coords=input_points,
-                point_labels=input_labels,
-                box=None,
-                multimask_output=True,
-            )
+            with torch.no_grad():
+                outputs = self._model(**inputs)
 
-            # Select best mask
-            best_idx = np.argmax(scores)
-            mask_data = masks[best_idx]
-            sam_score = float(scores[best_idx])
+            # Post-process results
+            results = self._processor.post_process_instance_segmentation(
+                outputs,
+                threshold=self.config.mask_threshold,
+                mask_threshold=self.config.mask_threshold,
+                target_sizes=inputs.get("original_sizes").tolist()
+            )[0]
+
+            if len(results['masks']) == 0:
+                return SegmentationResult(
+                    detection_id="point_segment",
+                    mask=None,
+                    success=False,
+                    error_message="No mask generated",
+                )
+
+            # Get the first mask
+            mask_data = results['masks'][0].cpu().numpy()
+            sam_score = float(results['scores'][0].cpu().numpy()) if len(results['scores']) > 0 else 1.0
 
             mask_binary = (mask_data > self.config.mask_threshold).astype(np.uint8)
 
