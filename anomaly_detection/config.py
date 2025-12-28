@@ -11,9 +11,9 @@ from typing import Optional
 
 # Default anomaly classes that VLM can detect
 DEFAULT_ANOMALY_CLASSES = {
-    "crack", "corrosion", "spalling", "deformation", "stain",
-    "efflorescence", "exposed_rebar", "delamination", "scaling",
-    "popout", "honeycomb", "rust",
+    "cracks", "corrosions", "spallings", "deformations", "stains",
+    "efflorescences", "exposed_rebars", "delaminations", "scaling",
+    "popouts", "honeycombs", "rusts", "land Cracks", "surface defects",
 }
 
 # Performance constants

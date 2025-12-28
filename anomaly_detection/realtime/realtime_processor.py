@@ -693,13 +693,14 @@ class RealtimeVideoProcessor:
 
     async def _process_frame(self, frame: BufferedFrame) -> FrameResult:
         """
-        Process a single buffered frame using SAM3-first pipeline.
+        Process a single buffered frame using SAM3-only pipeline (VLM disabled for video).
+
+        For video processing, we rotate through anomaly classes (1 per frame) to reduce
+        processing time. VLM is disabled for video as it's too slow and causes timeouts.
 
         Pipeline:
-        1. SAM3 segments ALL default anomaly classes (Title Case as text prompts)
-        2. Submit SAM3 candidates to VLM for judging (async)
-        3. Check for ready VLM judgments from previous frames
-        4. Only keep VLM-approved detections
+        1. SAM3 segments 1-2 anomaly classes per frame (rotating through all classes)
+        2. Results are shown immediately without VLM validation
         """
         start_time = time.perf_counter()
 
@@ -713,11 +714,20 @@ class RealtimeVideoProcessor:
         # Debug: Save original frame
         self._debug.save_original_frame(frame.frame_id, frame.frame_index, frame.image)
 
-        # STEP 1: Run SAM3 on ALL default anomaly classes (Title Case - first letter caps)
+        # STEP 1: Run SAM3 on ROTATING anomaly classes (1-2 per frame for video speed)
         seg_start = time.perf_counter()
-        anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]  # Convert to Title Case
+        all_anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]  # Convert to Title Case
 
-        logger.info(f"[Frame {frame.frame_index}] Running SAM3 on {len(anomaly_classes)} anomaly classes: {', '.join(anomaly_classes)}")
+        # Rotate: use 2 classes per frame, cycling through all classes
+        num_classes = len(all_anomaly_classes)
+        classes_per_frame = 2
+        start_idx = (frame.frame_index * classes_per_frame) % num_classes
+        anomaly_classes = [
+            all_anomaly_classes[(start_idx + i) % num_classes]
+            for i in range(classes_per_frame)
+        ]
+
+        logger.info(f"[Frame {frame.frame_index}] Running SAM3 on {len(anomaly_classes)} classes (rotating): {', '.join(anomaly_classes)}")
 
         sam_candidates = await self._segment_all_anomaly_classes(
             frame.image,
@@ -738,83 +748,25 @@ class RealtimeVideoProcessor:
             result.segmentation_time_ms
         )
 
-        # Store candidates for this frame
-        self._pending_sam_candidates[frame.frame_id] = sam_candidates
-
-        # STEP 2: Submit to VLM for judging (async) - every N frames
-        vlm_start = time.perf_counter()
-
-        if self._vlm_judge.should_process_frame(frame.frame_index):
-            logger.info(f"[Frame {frame.frame_index}] Submitting frame to VLM judge (will judge {len(sam_candidates)} SAM3 candidates)")
-
-            # Generate grid overlay for debug output
-            self._vlm_judge.grid.compute_grid(frame.image.shape[1], frame.image.shape[0])
-            grid_image = self._vlm_judge.grid.draw_grid(frame.image)
-
-            # Debug: Save VLM grid overlay
-            self._debug.save_vlm_grid(frame.frame_id, frame.frame_index, grid_image)
-
-            await self._vlm_judge.submit_frame_async(
-                frame.image,
-                frame.frame_id,
-                frame.frame_index,
+        # STEP 2: Convert SAM3 candidates directly to anomalies (NO VLM for video)
+        # VLM is disabled for video processing as it's too slow and causes timeouts
+        for candidate in sam_candidates:
+            anomaly = AnomalyResult(
+                anomaly_id=f"{frame.frame_id}_{candidate.defect_type}",
+                frame_id=frame.frame_id,
+                timestamp=frame.timestamp,
+                defect_type=candidate.defect_type,
+                structure_type=None,
+                bbox=candidate.bbox,
+                mask=SegmentationMask(data=candidate.mask, sam_score=candidate.confidence),
+                geometry=self._geometry.extract(candidate.mask),
+                detection_confidence=candidate.confidence,
+                segmentation_confidence=candidate.confidence,
+                association_confidence=1.0,
             )
+            result.anomalies.append(anomaly)
 
-        # STEP 3: Check for ready VLM judgments from previous frames
-        ready_judgments = await self._vlm_judge.get_ready_predictions(
-            frame.frame_index
-        )
-
-        for response in ready_judgments:
-            result.vlm_response = response
-            self._stats.total_vlm_predictions += len(response.predictions)
-
-            # Debug: Save VLM response
-            self._debug.save_vlm_response(
-                response.frame_id,
-                frame.frame_index,
-                response.predictions,
-                response.generation_time_ms,
-                response.request_frame_index
-            )
-
-            # Log VLM judgments
-            if response.predictions:
-                approved_count = sum(1 for p in response.predictions if p.confidence >= self.config.confidence_threshold)
-                logger.info(
-                    f"[Frame {response.frame_id}] VLM JUDGE: approved {approved_count}/{len(response.predictions)} "
-                    f"SAM3 candidates (latency: {response.generation_time_ms:.0f}ms)"
-                )
-                for pred in response.predictions:
-                    verdict = "✓ APPROVED" if pred.confidence >= self.config.confidence_threshold else "✗ REJECTED"
-                    logger.info(
-                        f"  {verdict}: {pred.defect_type.title()}, confidence: {pred.confidence:.2f}"
-                    )
-
-            # STEP 4: Filter SAM3 candidates by VLM judgment
-            if response.frame_id in self._pending_sam_candidates:
-                sam_candidates_for_frame = self._pending_sam_candidates[response.frame_id]
-
-                approved_anomalies = self._filter_by_vlm_judgment(
-                    sam_candidates_for_frame,
-                    response.predictions,
-                    response.frame_id,
-                )
-                result.vlm_judged_anomalies.extend(approved_anomalies)
-
-                # Debug: Save approved detections
-                self._debug.save_approved_detections(
-                    response.frame_id,
-                    frame.frame_index,
-                    frame.image,
-                    approved_anomalies,
-                    len(sam_candidates_for_frame)
-                )
-
-                # Clean up processed candidates
-                del self._pending_sam_candidates[response.frame_id]
-
-        result.vlm_time_ms = (time.perf_counter() - vlm_start) * 1000
+        result.vlm_time_ms = 0.0  # VLM disabled for video
         result.total_time_ms = (time.perf_counter() - start_time) * 1000
 
         # Debug: Save frame timing
