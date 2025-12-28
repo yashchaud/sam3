@@ -720,6 +720,18 @@
                     statusDot.classList.remove('processing');
                     statusText.textContent = 'Connected';
                     break;
+
+                case 'incremental_update':
+                    // Sequential tile processing update - show progress as each tile completes
+                    updateViewer(data.image);
+                    if (data.results) {
+                        document.getElementById('statDetections').textContent = data.results.anomalies.length;
+                        updateResultsList(data.results.anomalies);
+                    }
+                    if (data.step) {
+                        statusText.textContent = `Processing: ${data.step}`;
+                    }
+                    break;
             }
         }
 

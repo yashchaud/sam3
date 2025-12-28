@@ -234,16 +234,18 @@ class RealtimeVideoProcessor:
         self,
         image: np.ndarray,
         frame_id: str | None = None,
+        on_update: Callable[[FrameResult, np.ndarray], None] | None = None,
     ) -> FrameResult:
         """
-        Process a single image synchronously (waits for VLM response).
+        Process a single image with sequential tile processing and incremental updates.
 
-        For single images, we wait for VLM to respond and include SAM3 candidates
-        in the result even if VLM doesn't approve them (shown with lower confidence).
+        For single images, we process tiles sequentially and call on_update after each
+        step so the UI can show progress incrementally.
 
         Args:
             image: RGB image (HWC)
             frame_id: Optional frame identifier
+            on_update: Callback(result, image) called after each processing step
 
         Returns:
             FrameResult with all detections
@@ -260,22 +262,30 @@ class RealtimeVideoProcessor:
             frame_id=frame_id,
         )
 
-        # Process with synchronous VLM call for single images
-        result = await self._process_single_image_sync(buffered)
+        # Process with sequential tile updates
+        result = await self._process_single_image_sync(buffered, on_update=on_update)
         self._current_frame_index += 1
 
         return result
 
-    async def _process_single_image_sync(self, frame: BufferedFrame) -> FrameResult:
+    async def _process_single_image_sync(
+        self,
+        frame: BufferedFrame,
+        on_update: Callable[[FrameResult, np.ndarray], None] | None = None,
+    ) -> FrameResult:
         """
-        Process a single image with TRULY PARALLEL SAM3 + VLM pipeline.
+        Process a single image with SEQUENTIAL tile processing and incremental updates.
 
-        Flow (concurrent):
-        1. SAM3 Global + SAM3 Tiles + VLM all run concurrently
-        2. After VLM returns, SAM3 Point prompts segment VLM predictions
-        3. Union all masks with IoU-based deduplication
+        Flow:
+        1. SAM3 Global scan -> update UI
+        2. For each tile: SAM3 scan -> accumulate masks -> update UI
+        3. VLM runs in background, updates when ready
 
-        This maximizes GPU utilization by overlapping SAM3 compute with VLM API latency.
+        Each step sends an update via on_update callback so UI shows progress.
+
+        Args:
+            frame: The frame to process
+            on_update: Callback(result, image) called after each processing step
         """
         start_time = time.perf_counter()
 
@@ -286,12 +296,15 @@ class RealtimeVideoProcessor:
             timestamp=frame.timestamp,
         )
 
+        # Track all accumulated masks
+        all_masks = []
+
         # Debug: Save original frame
         self._debug.save_original_frame(frame.frame_id, frame.frame_index, frame.image)
 
         # Get defect classes for SAM3 text prompts
         anomaly_classes = [cls.title() for cls in DEFAULT_ANOMALY_CLASSES]
-        logger.info(f"[Frame {frame.frame_index}] Starting CONCURRENT pipeline with {len(anomaly_classes)} defect classes")
+        logger.info(f"[Frame {frame.frame_index}] Starting SEQUENTIAL pipeline with {len(anomaly_classes)} defect classes")
 
         # Generate grid overlay for VLM (but SAM3 uses original image!)
         self._vlm_judge.grid.compute_grid(frame.image.shape[1], frame.image.shape[0])
@@ -300,40 +313,7 @@ class RealtimeVideoProcessor:
 
         grid_config = self._vlm_judge.grid.config
 
-        # ========================================
-        # CONCURRENT EXECUTION: SAM3 Global + Tiles + VLM
-        # ========================================
-        # VLM is async (API call), SAM3 is sync (GPU compute)
-        # Run SAM3 in thread pool while VLM awaits network
-
-        concurrent_start = time.perf_counter()
-        logger.info(f"[Frame {frame.frame_index}] Running SAM3 (global+tiles) and VLM concurrently...")
-
-        # Define sync functions to run in executor
-        def run_sam3_global():
-            return self._segmenter.segment_with_text_batch(
-                frame.image,
-                anomaly_classes,
-                prefix=f"{frame.frame_id}_global"
-            )
-
-        def run_sam3_tiles():
-            return self._segmenter.segment_tiles_with_text(
-                frame.image,
-                anomaly_classes,
-                grid_cols=grid_config.cols,
-                grid_rows=grid_config.rows,
-                prefix=f"{frame.frame_id}_tile"
-            )
-
-        # Run SAM3 (both global and tiles) while VLM API call is in flight
-        # Note: SAM3 global and tiles share GPU, so run sequentially on GPU
-        # but VLM is pure network I/O, so can overlap with SAM3
-        import concurrent.futures
-
-        loop = asyncio.get_event_loop()
-
-        # Create VLM task (async - network I/O) - runs in background, non-blocking
+        # Start VLM in background (non-blocking network I/O)
         vlm_task = asyncio.create_task(
             self._vlm_judge.process_frame(
                 frame.image,
@@ -341,107 +321,23 @@ class RealtimeVideoProcessor:
                 frame.frame_index,
             )
         )
+        result.vlm_pending = True
+        result._vlm_task = vlm_task
 
-        # Run SAM3 operations in thread pool (GPU compute)
-        # Track timing for each phase
-        sam_global_time = 0.0
-        sam_tile_time = 0.0
+        # ========================================
+        # STEP 1: Global SAM3 scan
+        # ========================================
+        sam_global_start = time.perf_counter()
+        logger.info(f"[Frame {frame.frame_index}] SAM3 Global: Running...")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            sam_global_start = time.perf_counter()
-            sam_global_future = loop.run_in_executor(executor, run_sam3_global)
-            global_results = await sam_global_future
-            sam_global_time = (time.perf_counter() - sam_global_start) * 1000
-
-            sam_tile_start = time.perf_counter()
-            sam_tiles_future = loop.run_in_executor(executor, run_sam3_tiles)
-            tile_results = await sam_tiles_future
-            sam_tile_time = (time.perf_counter() - sam_tile_start) * 1000
-
-        logger.info(
-            f"[Frame {frame.frame_index}] SAM3 complete: "
-            f"global={len(global_results)} in {sam_global_time:.0f}ms, "
-            f"tiles={len(tile_results)} in {sam_tile_time:.0f}ms"
+        global_results = self._segmenter.segment_with_text_batch(
+            frame.image,
+            anomaly_classes,
+            prefix=f"{frame.frame_id}_global"
         )
+        sam_global_time = (time.perf_counter() - sam_global_start) * 1000
 
-        concurrent_time = (time.perf_counter() - concurrent_start) * 1000
-
-        # Check if VLM is done yet (non-blocking check)
-        vlm_response = None
-        vlm_point_results = []
-
-        if vlm_task.done():
-            try:
-                vlm_response = vlm_task.result()
-                logger.info(f"[Frame {frame.frame_index}] VLM already complete: {len(vlm_response.predictions) if vlm_response else 0} predictions")
-
-                # Store VLM timing
-                result.vlm_time_ms = vlm_response.generation_time_ms
-                result.vlm_response = vlm_response
-
-                if vlm_response.error_message:
-                    logger.warning(f"[Frame {frame.frame_index}] VLM error: {vlm_response.error_message}")
-
-                self._debug.save_vlm_response(
-                    frame.frame_id,
-                    frame.frame_index,
-                    vlm_response.predictions,
-                    vlm_response.generation_time_ms,
-                    frame.frame_index
-                )
-
-                # ========================================
-                # SAM3 Point Prompts from VLM predictions
-                # ========================================
-                if vlm_response.predictions:
-                    sam_point_start = time.perf_counter()
-                    logger.info(f"[Frame {frame.frame_index}] SAM3 Points: Segmenting {len(vlm_response.predictions)} VLM predictions...")
-
-                    for i, pred in enumerate(vlm_response.predictions):
-                        if pred.confidence < self.config.confidence_threshold:
-                            continue
-
-                        # Get cell center point for point prompt
-                        point_xy = None
-                        if pred.grid_cell:
-                            col, row = pred.grid_cell
-                            cell = self._vlm_judge.grid.get_cell(col, row)
-                            if cell:
-                                point_xy = (cell.center_x, cell.center_y)
-                                logger.debug(f"[Frame {frame.frame_index}] VLM pred {i}: {pred.defect_type} at cell ({col},{row}) -> point {point_xy}")
-
-                        if point_xy:
-                            seg_result = self._segmenter.segment_with_point(
-                                frame.image,  # Original image!
-                                point_xy,
-                                detection_id=f"{frame.frame_id}_vlm_{pred.defect_type}_{i}"
-                            )
-                            if seg_result.success and seg_result.mask:
-                                # Store with VLM confidence
-                                seg_result.mask.vlm_confidence = pred.confidence
-                                seg_result.mask.defect_type = pred.defect_type
-                                vlm_point_results.append(seg_result)
-                                logger.debug(f"[Frame {frame.frame_index}] ✓ VLM point: {pred.defect_type} (conf={pred.confidence:.2f})")
-
-                    sam_point_time = (time.perf_counter() - sam_point_start) * 1000
-                    logger.info(f"[Frame {frame.frame_index}] SAM3 Points: {len(vlm_point_results)} masks in {sam_point_time:.0f}ms")
-
-            except Exception as e:
-                logger.error(f"[Frame {frame.frame_index}] VLM task failed: {e}")
-        else:
-            # VLM still running - store task for later, mark as pending
-            result.vlm_pending = True
-            result._vlm_task = vlm_task
-            logger.info(f"[Frame {frame.frame_index}] VLM still in progress, returning SAM3 results immediately")
-
-        # ========================================
-        # STEP 5: Merge all masks with deduplication
-        # ========================================
-        merge_start = time.perf_counter()
-
-        all_masks = []
-
-        # Add global SAM3 results
+        # Add global results to accumulated masks
         for res in global_results:
             if res.success and res.mask:
                 defect_type = res.detection_id.split('_')[-2] if '_' in res.detection_id else "unknown"
@@ -453,47 +349,163 @@ class RealtimeVideoProcessor:
                     'vlm_confidence': None,
                 })
 
-        # Add per-tile SAM3 results
-        for res in tile_results:
-            if res.success and res.mask:
-                defect_type = res.detection_id.split('_')[-2] if '_' in res.detection_id else "unknown"
-                all_masks.append({
-                    'mask': res.mask.data,
-                    'score': res.mask.sam_score,
-                    'defect_type': defect_type,
-                    'source': 'tile',
-                    'vlm_confidence': None,
-                })
+        logger.info(f"[Frame {frame.frame_index}] SAM3 Global: {len(global_results)} masks in {sam_global_time:.0f}ms")
 
-        # Add VLM-prompted point results (higher priority due to VLM confidence)
-        for res in vlm_point_results:
-            if res.success and res.mask:
-                defect_type = getattr(res.mask, 'defect_type', 'unknown')
-                vlm_conf = getattr(res.mask, 'vlm_confidence', None)
-                all_masks.append({
-                    'mask': res.mask.data,
-                    'score': res.mask.sam_score,
-                    'defect_type': defect_type,
-                    'source': 'vlm_point',
-                    'vlm_confidence': vlm_conf,
-                })
+        # Update result and send to UI
+        self._update_result_from_masks(result, all_masks, frame)
+        result.segmentation_time_ms = sam_global_time
+        result.total_time_ms = (time.perf_counter() - start_time) * 1000
 
-        logger.info(f"[Frame {frame.frame_index}] Merge: {len(all_masks)} total masks before deduplication")
+        if on_update:
+            await self._call_update_async(on_update, result, frame.image)
 
+        # ========================================
+        # STEP 2: Per-tile SAM3 scans (sequential)
+        # ========================================
+        h, w = frame.image.shape[:2]
+        tile_h = h // grid_config.rows
+        tile_w = w // grid_config.cols
+
+        sam_tile_time = 0.0
+
+        for row in range(grid_config.rows):
+            for col in range(grid_config.cols):
+                tile_label = f"{chr(65 + row)}{col + 1}"
+                tile_start = time.perf_counter()
+
+                # Extract tile
+                y_start = row * tile_h
+                x_start = col * tile_w
+                y_end = h if row == grid_config.rows - 1 else (row + 1) * tile_h
+                x_end = w if col == grid_config.cols - 1 else (col + 1) * tile_w
+
+                tile = frame.image[y_start:y_end, x_start:x_end]
+
+                # Process tile with all prompts
+                tile_results = self._segmenter.segment_with_text_batch(
+                    tile,
+                    anomaly_classes,
+                    prefix=f"{frame.frame_id}_tile_{tile_label}"
+                )
+
+                tile_time = (time.perf_counter() - tile_start) * 1000
+                sam_tile_time += tile_time
+
+                # Add tile results to accumulated masks (transform to full image coords)
+                new_masks_count = 0
+                for res in tile_results:
+                    if res.success and res.mask:
+                        defect_type = res.detection_id.split('_')[-2] if '_' in res.detection_id else "unknown"
+
+                        # Transform mask to full image coordinates
+                        full_mask = np.zeros((h, w), dtype=np.uint8)
+                        mask_h, mask_w = res.mask.data.shape[:2]
+                        full_mask[y_start:y_start + mask_h, x_start:x_start + mask_w] = res.mask.data
+
+                        all_masks.append({
+                            'mask': full_mask,
+                            'score': res.mask.sam_score,
+                            'defect_type': defect_type,
+                            'source': f'tile_{tile_label}',
+                            'vlm_confidence': None,
+                        })
+                        new_masks_count += 1
+
+                logger.info(f"[Frame {frame.frame_index}] SAM3 Tile {tile_label}: {new_masks_count} masks in {tile_time:.0f}ms")
+
+                # Update result with all accumulated masks and send to UI
+                self._update_result_from_masks(result, all_masks, frame)
+                result.segmentation_time_ms = sam_global_time + sam_tile_time
+                result.total_time_ms = (time.perf_counter() - start_time) * 1000
+
+                if on_update:
+                    await self._call_update_async(on_update, result, frame.image)
+
+                # Brief yield to allow other async tasks (like VLM) to progress
+                await asyncio.sleep(0)
+
+        logger.info(f"[Frame {frame.frame_index}] SAM3 Tiles complete: {sam_tile_time:.0f}ms total")
+
+        # ========================================
+        # STEP 3: Check if VLM is done
+        # ========================================
+        if vlm_task.done():
+            try:
+                vlm_response = vlm_task.result()
+                result.vlm_pending = False
+                result._vlm_task = None
+                result.vlm_time_ms = vlm_response.generation_time_ms
+                result.vlm_response = vlm_response
+
+                logger.info(f"[Frame {frame.frame_index}] VLM complete: {len(vlm_response.predictions) if vlm_response else 0} predictions")
+
+                if vlm_response and vlm_response.predictions:
+                    # Process VLM predictions with point prompts
+                    for i, pred in enumerate(vlm_response.predictions):
+                        if pred.confidence < self.config.confidence_threshold:
+                            continue
+
+                        point_xy = None
+                        if pred.grid_cell:
+                            col, row = pred.grid_cell
+                            cell = self._vlm_judge.grid.get_cell(col, row)
+                            if cell:
+                                point_xy = (cell.center_x, cell.center_y)
+
+                        if point_xy:
+                            seg_result = self._segmenter.segment_with_point(
+                                frame.image,
+                                point_xy,
+                                detection_id=f"{frame.frame_id}_vlm_{pred.defect_type}_{i}"
+                            )
+                            if seg_result.success and seg_result.mask:
+                                all_masks.append({
+                                    'mask': seg_result.mask.data,
+                                    'score': seg_result.mask.sam_score,
+                                    'defect_type': pred.defect_type,
+                                    'source': 'vlm_point',
+                                    'vlm_confidence': pred.confidence,
+                                })
+
+                    # Final update with VLM results
+                    self._update_result_from_masks(result, all_masks, frame)
+                    if on_update:
+                        await self._call_update_async(on_update, result, frame.image)
+
+            except Exception as e:
+                logger.error(f"[Frame {frame.frame_index}] VLM task failed: {e}")
+                result.vlm_pending = False
+
+        # Final timing
+        result.total_time_ms = (time.perf_counter() - start_time) * 1000
+        result.sam_candidate_count = len(all_masks)
+
+        logger.info(
+            f"[Frame {frame.frame_index}] Complete: {len(result.all_anomalies)} anomalies "
+            f"in {result.total_time_ms:.0f}ms (VLM pending: {result.vlm_pending})"
+        )
+
+        return result
+
+    def _update_result_from_masks(
+        self,
+        result: FrameResult,
+        all_masks: list[dict],
+        frame: BufferedFrame,
+    ) -> None:
+        """Update FrameResult anomalies from accumulated masks with deduplication."""
         # Deduplicate by IoU
         deduplicated = self._deduplicate_masks(all_masks, iou_threshold=0.5)
-        merge_time = (time.perf_counter() - merge_start) * 1000
-        logger.info(f"[Frame {frame.frame_index}] Merge: {len(deduplicated)} masks after deduplication ({merge_time:.0f}ms)")
 
-        # ========================================
-        # STEP 6: Create AnomalyResults from deduplicated masks
-        # ========================================
+        # Clear and rebuild anomalies
+        result.vlm_judged_anomalies.clear()
+
         for i, mask_info in enumerate(deduplicated):
             mask_data = mask_info['mask']
-            geometry = self._geometry.extract(mask_data)
             bbox = self._extract_bbox_from_mask(mask_data)
 
             if bbox:
+                geometry = self._geometry.extract(mask_data)
                 anomaly = AnomalyResult(
                     anomaly_id=f"{frame.frame_id}_{mask_info['defect_type']}_{i}",
                     frame_id=frame.frame_id,
@@ -509,57 +521,21 @@ class RealtimeVideoProcessor:
                 )
                 result.vlm_judged_anomalies.append(anomaly)
 
-                # Debug: save each candidate
-                self._debug.save_sam3_candidate(
-                    frame.frame_id,
-                    frame.frame_index,
-                    mask_info['defect_type'],
-                    mask_data,
-                    frame.image,
-                    mask_info['score']
-                )
-
-        # Update timing
-        result.segmentation_time_ms = sam_global_time + sam_tile_time + merge_time
         result.sam_candidate_count = len(all_masks)
 
-        # Debug summaries
-        self._debug.save_sam3_summary(
-            frame.frame_id,
-            frame.frame_index,
-            result.sam_candidate_count,
-            [a.defect_type for a in result.vlm_judged_anomalies],
-            result.segmentation_time_ms
-        )
-
-        if result.all_anomalies:
-            self._debug.save_approved_detections(
-                frame.frame_id,
-                frame.frame_index,
-                frame.image,
-                result.all_anomalies,
-                result.sam_candidate_count
-            )
-
-        result.total_time_ms = (time.perf_counter() - start_time) * 1000
-
-        self._debug.save_frame_timing(
-            frame.frame_id,
-            frame.frame_index,
-            result.segmentation_time_ms,
-            result.vlm_time_ms,
-            result.total_time_ms,
-            result.sam_candidate_count,
-            len(result.vlm_judged_anomalies)
-        )
-
-        logger.info(
-            f"[Frame {frame.frame_index}] Complete: {len(result.all_anomalies)} anomalies "
-            f"(global:{len(global_results)}, tile:{len(tile_results)}, vlm:{len(vlm_point_results)}) "
-            f"in {result.total_time_ms:.0f}ms"
-        )
-
-        return result
+    async def _call_update_async(
+        self,
+        callback: Callable[[FrameResult, np.ndarray], None],
+        result: FrameResult,
+        image: np.ndarray,
+    ) -> None:
+        """Call update callback, handling both sync and async callbacks."""
+        try:
+            ret = callback(result, image)
+            if asyncio.iscoroutine(ret):
+                await ret
+        except Exception as e:
+            logger.error(f"Update callback error: {e}")
 
     def _deduplicate_masks(
         self,

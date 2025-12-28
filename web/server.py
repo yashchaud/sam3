@@ -311,10 +311,10 @@ def encode_image_base64(image: np.ndarray) -> str:
 
 @app.post("/api/process/image")
 async def process_image(file: UploadFile = File(...)):
-    """Process a single uploaded image.
+    """Process a single uploaded image with incremental updates.
 
-    Returns SAM3 results immediately. If VLM is still processing,
-    a WebSocket update will be sent when VLM completes.
+    Sends WebSocket updates after each processing step (global, each tile).
+    Final HTTP response contains complete results.
     """
     global state
 
@@ -328,11 +328,45 @@ async def process_image(file: UploadFile = File(...)):
         image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # Process - returns immediately with SAM3 results
-        # VLM may still be pending
-        result = await state.processor.process_single_image(image, frame_id=file.filename)
+        # Track processing step for UI updates
+        update_counter = [0]  # Use list for mutable closure
 
-        # Draw annotations with current results
+        # Define incremental update callback
+        async def on_incremental_update(result, img):
+            """Send incremental update via WebSocket."""
+            annotated = annotate_image(img, result)
+            img_base64 = encode_image_base64(annotated)
+
+            # Determine current step based on update count
+            update_counter[0] += 1
+            if update_counter[0] == 1:
+                step = "Global scan"
+            else:
+                tile_num = update_counter[0] - 1
+                step = f"Tile {tile_num}/9"
+
+            await broadcast_message({
+                "type": "incremental_update",
+                "frame_id": file.filename,
+                "step": step,
+                "image": f"data:image/jpeg;base64,{img_base64}",
+                "results": {
+                    "anomalies": [a.to_dict() for a in result.all_anomalies],
+                    "vlm_judged_count": len(result.vlm_judged_anomalies),
+                    "vlm_pending": result.vlm_pending,
+                    "timing_ms": result.total_time_ms,
+                    "sam_candidates": result.sam_candidate_count,
+                }
+            })
+
+        # Process with incremental updates
+        result = await state.processor.process_single_image(
+            image,
+            frame_id=file.filename,
+            on_update=on_incremental_update
+        )
+
+        # Draw final annotations
         annotated = annotate_image(image, result)
         img_base64 = encode_image_base64(annotated)
 
@@ -351,7 +385,7 @@ async def process_image(file: UploadFile = File(...)):
             }
         }
 
-        # If VLM is pending, schedule background task to send update when ready
+        # If VLM is still pending, schedule background task
         if result.vlm_pending:
             asyncio.create_task(
                 send_vlm_update_when_ready(state.processor, result, image, file.filename)
