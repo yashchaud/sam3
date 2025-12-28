@@ -695,6 +695,31 @@
                     statusDot.classList.remove('processing');
                     document.getElementById('videoControls').classList.add('hidden');
                     break;
+
+                case 'vlm_update':
+                    // VLM finished and found new detections - update the image
+                    updateViewer(data.image);
+                    showToast(data.message || 'VLM analysis complete - image updated', 'success');
+                    if (data.results) {
+                        document.getElementById('statDetections').textContent = data.results.anomalies.length;
+                        updateResultsList(data.results.anomalies);
+                    }
+                    statusDot.classList.remove('processing');
+                    statusText.textContent = 'Connected';
+                    break;
+
+                case 'vlm_complete':
+                    // VLM finished but no new detections
+                    showToast(data.message || 'VLM analysis complete', 'info');
+                    statusDot.classList.remove('processing');
+                    statusText.textContent = 'Connected';
+                    break;
+
+                case 'vlm_error':
+                    showToast(`VLM error: ${data.error}`, 'error');
+                    statusDot.classList.remove('processing');
+                    statusText.textContent = 'Connected';
+                    break;
             }
         }
 
@@ -857,16 +882,27 @@
                     updateResultsList(data.results.anomalies);
                     document.getElementById('statDetections').textContent = data.results.anomalies.length;
                     document.getElementById('statLatency').textContent = `${Math.round(data.results.timing_ms)}ms`;
-                    showToast(`Found ${data.results.anomalies.length} anomalies`, 'success');
+
+                    if (data.results.vlm_pending) {
+                        // SAM3 results shown, VLM still running
+                        showToast(`SAM3: ${data.results.anomalies.length} detections. VLM analyzing...`, 'info');
+                        statusText.textContent = 'VLM analyzing...';
+                        // Keep processing indicator - will be cleared by WebSocket update
+                    } else {
+                        showToast(`Found ${data.results.anomalies.length} anomalies`, 'success');
+                        statusDot.classList.remove('processing');
+                        statusText.textContent = 'Connected';
+                    }
                 } else {
                     showToast(data.detail, 'error');
+                    statusDot.classList.remove('processing');
+                    statusText.textContent = 'Connected';
                 }
             } catch (error) {
                 showToast('Upload failed: ' + error.message, 'error');
+                statusDot.classList.remove('processing');
+                statusText.textContent = 'Connected';
             }
-
-            statusDot.classList.remove('processing');
-            statusText.textContent = 'Connected';
         }
 
         async function handleVideoUpload(file) {

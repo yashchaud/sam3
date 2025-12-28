@@ -267,9 +267,55 @@ async def get_status():
     )
 
 
+def annotate_image(image: np.ndarray, result) -> np.ndarray:
+    """Draw annotations (masks, boxes, labels) on image."""
+    annotated = image.copy()
+
+    # Draw masks
+    for anomaly in result.all_anomalies:
+        if anomaly.mask:
+            annotated = draw_mask_overlay(annotated, anomaly.mask.data, color=(255, 0, 0), alpha=0.4)
+
+    # Draw boxes for anomalies
+    for anomaly in result.all_anomalies:
+        cv2.rectangle(
+            annotated,
+            (anomaly.bbox.x_min, anomaly.bbox.y_min),
+            (anomaly.bbox.x_max, anomaly.bbox.y_max),
+            (255, 0, 0),
+            2,
+        )
+        label = f"{anomaly.defect_type}: {anomaly.detection_confidence:.0%}"
+        cv2.putText(annotated, label, (anomaly.bbox.x_min, anomaly.bbox.y_min - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+    # Draw structures
+    for struct in result.structures:
+        cv2.rectangle(
+            annotated,
+            (struct.bbox.x_min, struct.bbox.y_min),
+            (struct.bbox.x_max, struct.bbox.y_max),
+            (0, 255, 0),
+            2,
+        )
+
+    return annotated
+
+
+def encode_image_base64(image: np.ndarray) -> str:
+    """Encode image to base64 JPEG string."""
+    annotated_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    _, buffer = cv2.imencode('.jpg', annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return base64.b64encode(buffer).decode('utf-8')
+
+
 @app.post("/api/process/image")
 async def process_image(file: UploadFile = File(...)):
-    """Process a single uploaded image."""
+    """Process a single uploaded image.
+
+    Returns SAM3 results immediately. If VLM is still processing,
+    a WebSocket update will be sent when VLM completes.
+    """
     global state
 
     if state.processor is None or not state.processor.is_loaded():
@@ -282,46 +328,15 @@ async def process_image(file: UploadFile = File(...)):
         image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # Process
+        # Process - returns immediately with SAM3 results
+        # VLM may still be pending
         result = await state.processor.process_single_image(image, frame_id=file.filename)
 
-        # Draw annotations
-        annotated = image.copy()
+        # Draw annotations with current results
+        annotated = annotate_image(image, result)
+        img_base64 = encode_image_base64(annotated)
 
-        # Draw masks
-        for anomaly in result.all_anomalies:
-            if anomaly.mask:
-                annotated = draw_mask_overlay(annotated, anomaly.mask.data, color=(255, 0, 0), alpha=0.4)
-
-        # Draw boxes for anomalies
-        for anomaly in result.all_anomalies:
-            cv2.rectangle(
-                annotated,
-                (anomaly.bbox.x_min, anomaly.bbox.y_min),
-                (anomaly.bbox.x_max, anomaly.bbox.y_max),
-                (255, 0, 0),
-                2,
-            )
-            label = f"{anomaly.defect_type}: {anomaly.detection_confidence:.0%}"
-            cv2.putText(annotated, label, (anomaly.bbox.x_min, anomaly.bbox.y_min - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-
-        # Draw structures
-        for struct in result.structures:
-            cv2.rectangle(
-                annotated,
-                (struct.bbox.x_min, struct.bbox.y_min),
-                (struct.bbox.x_max, struct.bbox.y_max),
-                (0, 255, 0),
-                2,
-            )
-
-        # Encode result image
-        annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
-        _, buffer = cv2.imencode('.jpg', annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        img_base64 = base64.b64encode(buffer).decode('utf-8')
-
-        return {
+        response_data = {
             "status": "ok",
             "image": f"data:image/jpeg;base64,{img_base64}",
             "results": {
@@ -331,12 +346,63 @@ async def process_image(file: UploadFile = File(...)):
                     for s in result.structures
                 ],
                 "vlm_judged_count": len(result.vlm_judged_anomalies),
+                "vlm_pending": result.vlm_pending,
                 "timing_ms": result.total_time_ms,
             }
         }
 
+        # If VLM is pending, schedule background task to send update when ready
+        if result.vlm_pending:
+            asyncio.create_task(
+                send_vlm_update_when_ready(state.processor, result, image, file.filename)
+            )
+
+        return response_data
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def send_vlm_update_when_ready(processor, result, image: np.ndarray, filename: str):
+    """Background task: await VLM completion and send WebSocket update."""
+    try:
+        updated_result = await processor.await_vlm_update(result, image)
+
+        if updated_result and len(updated_result.all_anomalies) > len(result.all_anomalies):
+            # VLM added new detections - send update via WebSocket
+            annotated = annotate_image(image, updated_result)
+            img_base64 = encode_image_base64(annotated)
+
+            await broadcast_message({
+                "type": "vlm_update",
+                "frame_id": filename,
+                "image": f"data:image/jpeg;base64,{img_base64}",
+                "results": {
+                    "anomalies": [a.to_dict() for a in updated_result.all_anomalies],
+                    "vlm_judged_count": len(updated_result.vlm_judged_anomalies),
+                    "vlm_time_ms": updated_result.vlm_time_ms,
+                },
+                "message": f"VLM added {len(updated_result.all_anomalies) - len(result.all_anomalies)} new detections"
+            })
+            logger.info(f"Sent VLM update for {filename}: {len(updated_result.all_anomalies)} total anomalies")
+        else:
+            # VLM finished but no new detections
+            await broadcast_message({
+                "type": "vlm_complete",
+                "frame_id": filename,
+                "vlm_time_ms": updated_result.vlm_time_ms if updated_result else 0,
+                "message": "VLM analysis complete, no additional detections"
+            })
+
+    except Exception as e:
+        logger.error(f"VLM update task failed: {e}")
+        await broadcast_message({
+            "type": "vlm_error",
+            "frame_id": filename,
+            "error": str(e)
+        })
 
 
 @app.post("/api/process/video")
