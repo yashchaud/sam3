@@ -7,6 +7,7 @@ from .models import (
     VLMPrediction,
     VLMResponse,
     LatencyStats,
+    PredictionType,
 )
 from .grid_overlay import GridOverlay
 from .qwen_client import QwenVLClient
@@ -20,6 +21,7 @@ __all__ = [
     "VLMPrediction",
     "VLMResponse",
     "LatencyStats",
+    "PredictionType",
     "GridOverlay",
     "QwenVLClient",
     "OpenRouterClient",
