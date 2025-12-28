@@ -2,6 +2,7 @@
 
 Pipeline: VLM (OpenRouter) -> SAM3 Segmentation
 Configuration is loaded from environment variables.
+Models are auto-loaded on server startup.
 """
 
 import asyncio
@@ -11,6 +12,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field
@@ -33,7 +35,66 @@ from anomaly_detection.utils import load_image, draw_detections, draw_mask_overl
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Anomaly Detection", version="0.3.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager - auto-load models on startup."""
+    # Startup: Load models automatically
+    logger.info("Server starting - loading models from environment configuration...")
+
+    try:
+        env_config = get_config()
+        env_config.print_config()
+
+        # Validate configuration
+        errors = env_config.validate()
+        if errors:
+            logger.error(f"Configuration errors: {'; '.join(errors)}")
+            logger.warning("Models NOT loaded due to configuration errors. Fix .env and restart.")
+        else:
+            # Build VLM config
+            vlm_config = VLMConfig(
+                provider=VLMProvider.OPENROUTER,
+                openrouter_api_key=env_config.openrouter_api_key,
+                openrouter_model=env_config.openrouter_model,
+                process_every_n_frames=env_config.vlm_every_n_frames,
+                max_generation_frames=env_config.vlm_max_generation_frames,
+                grid_config=GridConfig(cols=3, rows=3),
+            )
+
+            # Build main config
+            config = RealtimeConfig(
+                segmenter_model_path=env_config.sam3_model_path,
+                vlm_config=vlm_config,
+                confidence_threshold=env_config.confidence_threshold,
+                device=env_config.device,
+            )
+
+            # Create and load processor
+            global state
+            state.config = config
+            state.processor = RealtimeVideoProcessor(config)
+            state.processor.load()
+
+            logger.info("Models loaded successfully!")
+            logger.info(f"  SAM3: {env_config.sam3_model_path}")
+            logger.info(f"  VLM: {env_config.openrouter_model}")
+
+    except Exception as e:
+        logger.error(f"Failed to auto-load models: {e}")
+        logger.warning("Server running but models NOT loaded. Use /api/load to retry.")
+
+    yield  # Server runs here
+
+    # Shutdown: Cleanup
+    logger.info("Server shutting down - unloading models...")
+    if state.processor is not None:
+        state.processor.unload()
+        state.processor = None
+    logger.info("Cleanup complete.")
+
+
+app = FastAPI(title="Anomaly Detection", version="0.3.0", lifespan=lifespan)
 
 # CORS for development
 app.add_middleware(
@@ -106,6 +167,7 @@ async def root():
 async def get_current_config():
     """Get current configuration from environment."""
     env_config = get_config()
+    models_loaded = state.processor is not None and state.processor.is_loaded()
     return {
         "sam3_model_path": str(env_config.sam3_model_path) if env_config.sam3_model_path else None,
         "openrouter_model": env_config.openrouter_model,
@@ -113,6 +175,7 @@ async def get_current_config():
         "vlm_every_n_frames": env_config.vlm_every_n_frames,
         "confidence_threshold": env_config.confidence_threshold,
         "device": env_config.device,
+        "models_loaded": models_loaded,
     }
 
 
