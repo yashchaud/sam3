@@ -156,13 +156,33 @@ class OpenRouterClient(BaseVLMClient):
                         provider=VLMProvider.OPENROUTER,
                     )
 
-                data = await response.json()
+                # Read response body inside the context manager
+                response_body = await response.text()
+                logger.info(f"[OpenRouter] Response body length: {len(response_body)} chars")
+                logger.info(f"[OpenRouter] Response body preview: {response_body[:500]}")
 
-            # Extract response text
+                try:
+                    data = json.loads(response_body)
+                except json.JSONDecodeError as e:
+                    logger.error(f"[OpenRouter] Failed to parse response JSON: {e}")
+                    logger.error(f"[OpenRouter] Raw body: {response_body[:1000]}")
+                    return VLMResponse(
+                        frame_id=frame_id,
+                        predictions=[],
+                        generation_time_ms=generation_time_ms,
+                        is_valid=False,
+                        error_message=f"Invalid JSON response: {str(e)}",
+                        provider=VLMProvider.OPENROUTER,
+                    )
+
+            # Extract response text from API response
             response_text = ""
             if "choices" in data and len(data["choices"]) > 0:
                 message = data["choices"][0].get("message", {})
                 response_text = message.get("content", "")
+                logger.info(f"[OpenRouter] Extracted content from choices: {len(response_text)} chars")
+            else:
+                logger.warning(f"[OpenRouter] No 'choices' in response. Keys: {list(data.keys())}")
 
             # Log raw VLM response
             logger.info(f"[OpenRouter] Model: {self.config.openrouter_model}")
@@ -180,8 +200,9 @@ class OpenRouterClient(BaseVLMClient):
                 provider=VLMProvider.OPENROUTER,
             )
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             generation_time_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(f"[OpenRouter] TIMEOUT ERROR: {e}")
             return VLMResponse(
                 frame_id=frame_id,
                 predictions=[],
@@ -193,6 +214,7 @@ class OpenRouterClient(BaseVLMClient):
 
         except aiohttp.ClientError as e:
             generation_time_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(f"[OpenRouter] CLIENT ERROR: {type(e).__name__}: {e}")
             return VLMResponse(
                 frame_id=frame_id,
                 predictions=[],
@@ -204,6 +226,9 @@ class OpenRouterClient(BaseVLMClient):
 
         except Exception as e:
             generation_time_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(f"[OpenRouter] UNEXPECTED ERROR: {type(e).__name__}: {e}")
+            import traceback
+            logger.error(f"[OpenRouter] Traceback: {traceback.format_exc()}")
             return VLMResponse(
                 frame_id=frame_id,
                 predictions=[],
