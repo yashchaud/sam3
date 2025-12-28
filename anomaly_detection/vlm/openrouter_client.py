@@ -217,33 +217,48 @@ class OpenRouterClient(BaseVLMClient):
         """Parse model response into predictions."""
         predictions = []
 
+        logger.info(f"[OpenRouter] Parsing response text ({len(response_text)} chars)")
+
         try:
             json_match = re.search(r'\{[\s\S]*\}', response_text)
             if not json_match:
+                logger.warning(f"[OpenRouter] No JSON found in response: {response_text[:200]}")
                 return predictions
 
-            data = json.loads(json_match.group())
+            json_str = json_match.group()
+            logger.info(f"[OpenRouter] Found JSON: {json_str[:300]}")
+
+            data = json.loads(json_str)
 
             if "predictions" not in data:
+                logger.warning(f"[OpenRouter] No 'predictions' key in JSON. Keys: {list(data.keys())}")
                 return predictions
 
-            for pred in data["predictions"]:
+            logger.info(f"[OpenRouter] Found {len(data['predictions'])} predictions in JSON")
+
+            for i, pred in enumerate(data["predictions"]):
                 cell_label = pred.get("cell", "").strip().upper()
                 defect_type = pred.get("defect_type", "unknown")
                 confidence = float(pred.get("confidence", 0.5))
 
+                logger.info(f"[OpenRouter] Prediction {i}: cell={cell_label}, type={defect_type}, conf={confidence}")
+
                 if not cell_label:
+                    logger.warning(f"[OpenRouter] Skipping prediction {i}: empty cell label")
                     continue
 
                 confidence = max(0.0, min(1.0, confidence))
 
                 if confidence < self.config.min_confidence:
+                    logger.warning(f"[OpenRouter] Skipping prediction {i}: confidence {confidence} < min {self.config.min_confidence}")
                     continue
 
                 col_row = self._parse_cell_label(cell_label)
                 if col_row is None:
+                    logger.warning(f"[OpenRouter] Skipping prediction {i}: invalid cell label '{cell_label}'")
                     continue
 
+                logger.info(f"[OpenRouter] Adding prediction: {defect_type} at {cell_label} -> col={col_row[0]}, row={col_row[1]}")
                 predictions.append(VLMPrediction(
                     prediction_type=PredictionType.POINT,
                     confidence=confidence,
@@ -251,9 +266,13 @@ class OpenRouterClient(BaseVLMClient):
                     grid_cell=col_row,
                 ))
 
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
-            pass
+        except json.JSONDecodeError as e:
+            logger.error(f"[OpenRouter] JSON parse error: {e}")
+            logger.error(f"[OpenRouter] Response was: {response_text[:500]}")
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"[OpenRouter] Parse error: {e}")
 
+        logger.info(f"[OpenRouter] Final parsed predictions: {len(predictions)}")
         return predictions[:self.config.max_predictions_per_frame]
 
     def _parse_cell_label(self, label: str) -> tuple[int, int] | None:

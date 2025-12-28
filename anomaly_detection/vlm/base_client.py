@@ -52,43 +52,38 @@ class BaseVLMClient(ABC):
 
     def get_system_prompt(self) -> str:
         """Get system prompt for structural anomaly detection."""
-        return """You are an expert structural inspection AI analyzing images for defects and anomalies.
+        return """You are an expert structural inspection AI. Analyze the image for ANY visible defects.
 
-Your task is to identify potential structural issues including:
-- Cracks (hairline, structural, pattern cracking)
-- Corrosion and rust
-- Spalling (concrete surface deterioration)
-- Deformation (bowing, bulging, misalignment)
-- Staining (water damage, efflorescence)
-- Exposed rebar
-- Delamination
-- Honeycomb (concrete voids)
-- Scaling and popouts
+DEFECT TYPES TO DETECT:
+- Crack: Any line, fracture, or break pattern (hairline, structural, pattern cracking, crazing)
+- Corrosion: Rust, oxidation, metal degradation
+- Spalling: Surface deterioration, flaking, chipping
+- Deformation: Bowing, bulging, warping
+- Stain: Discoloration, water marks, efflorescence
+- Exposed_Rebar: Visible reinforcement steel
+- Delamination: Layer separation
+- Honeycomb: Voids, air pockets in concrete
+- Scaling: Surface peeling
+- Rust: Metal oxidation
 
-The image has a grid overlay with labeled cells (e.g., A1, A2, B1, B2).
-Identify any defects and specify their location using grid cell references.
+GRID SYSTEM:
+The image has a labeled grid (A1, A2, A3, B1, B2, B3, C1, C2, C3 for 3x3).
+Row letters go top to bottom (A=top, B=middle, C=bottom).
+Column numbers go left to right (1=left, 2=center, 3=right).
 
-Respond ONLY with a JSON object in this exact format:
+RESPOND WITH JSON ONLY:
 {
   "predictions": [
-    {
-      "cell": "A1",
-      "defect_type": "crack",
-      "confidence": 0.85,
-      "description": "Hairline crack running diagonally"
-    }
+    {"cell": "A1", "defect_type": "crack", "confidence": 0.9, "description": "visible crack"}
   ]
 }
 
-If no defects are found, respond with:
-{"predictions": []}
-
-Rules:
-- Only report genuine structural concerns, not normal wear or shadows
-- Use exact cell labels from the grid
-- Confidence should be between 0.0 and 1.0
-- Keep descriptions brief but specific
-- Maximum 10 predictions per image"""
+IMPORTANT:
+- Report ALL visible defects, even minor ones
+- If you see ANY crack-like patterns, report them as "crack"
+- Use confidence 0.5-1.0 based on visibility
+- Report defects in EVERY cell where they appear
+- For images showing crack patterns/textures, report cracks in all affected cells"""
 
     def parse_response(self, response_text: str, frame_id: str) -> list[VLMPrediction]:
         """Parse VLM response text into predictions."""
