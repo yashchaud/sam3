@@ -495,7 +495,7 @@ async def process_video_task(video_path: str):
         })
 
         # Process video using processor.process_video() with video tracker
-        from ..realtime import FrameSource
+        # FrameSource already imported at top of file
 
         # Open video capture for reading frames to annotate
         cap = cv2.VideoCapture(video_path)
