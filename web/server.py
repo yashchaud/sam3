@@ -70,10 +70,10 @@ async def lifespan(app: FastAPI):
                 device=env_config.device,
             )
 
-            # Create and load processor
+            # Create and load processor with debug output enabled
             global state
             state.config = config
-            state.processor = RealtimeVideoProcessor(config)
+            state.processor = RealtimeVideoProcessor(config, debug_output_dir="output/debug")
             state.processor.load()
 
             logger.info("Models loaded successfully!")
@@ -215,7 +215,7 @@ async def load_models():
         if state.processor is not None:
             state.processor.unload()
 
-        state.processor = RealtimeVideoProcessor(state.config)
+        state.processor = RealtimeVideoProcessor(state.config, debug_output_dir="output/debug")
         state.processor.load()
 
         logger.info(f"Models loaded - SAM3: facebook/sam3 (HuggingFace), VLM: {env_config.openrouter_model}")

@@ -718,7 +718,7 @@
                 const response = await fetch('/api/config');
                 if (response.ok) {
                     const config = await response.json();
-                    document.getElementById('configSam3').textContent = config.sam3_model_path || 'Not set';
+                    document.getElementById('configSam3').textContent = config.sam3_model || 'Not set';
                     document.getElementById('configVlmModel').textContent = config.openrouter_model || '-';
                     document.getElementById('configApiKey').textContent = config.openrouter_api_key_set ? 'Set' : 'Not set';
                     document.getElementById('configDevice').textContent = config.device || 'auto';

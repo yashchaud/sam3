@@ -3,9 +3,12 @@
 from dataclasses import dataclass
 from pathlib import Path
 import time
+import logging
 import numpy as np
 
 from ..models import Detection, SegmentationMask
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -13,8 +16,9 @@ class SegmenterConfig:
     """Configuration for SAM3 segmenter."""
     model_path: Path | None = None
     device: str = "auto"
-    mask_threshold: float = 0.0
-    use_text_prompts: bool = False
+    mask_threshold: float = 0.5
+    score_threshold: float = 0.5
+    use_text_prompts: bool = True
     max_masks_per_detection: int = 1
     hf_token: str | None = None
 
@@ -34,11 +38,11 @@ class SAM3Segmenter:
     def __init__(self, config: SegmenterConfig | None = None):
         self.config = config or SegmenterConfig()
         self._model = None
-        self._predictor = None
+        self._processor = None
         self._device = None
         self._is_loaded = False
         self._current_image = None
-        self._inference_state = None
+        self._current_image_size = None
 
     def load(self) -> None:
         """Load the SAM3 model."""
@@ -54,12 +58,12 @@ class SAM3Segmenter:
             else:
                 self._device = self.config.device
 
+            logger.info(f"Loading SAM3 model on device: {self._device}")
+
             # Import SAM3 modules (Transformers implementation)
             from transformers import Sam3Model, Sam3Processor
-            import torch
 
             # Load model from HuggingFace Hub
-            # SAM3 is always loaded from HuggingFace, transformers handles caching automatically
             model_kwargs = {}
             if self.config.hf_token:
                 model_kwargs["token"] = self.config.hf_token
@@ -67,21 +71,21 @@ class SAM3Segmenter:
             self._model = Sam3Model.from_pretrained("facebook/sam3", **model_kwargs).to(self._device)
             self._processor = Sam3Processor.from_pretrained("facebook/sam3", **model_kwargs)
 
-            self._predictor = self._processor  # For compatibility
             self._is_loaded = True
+            logger.info("SAM3 model loaded successfully")
 
         except ImportError as e:
             raise ImportError(
-                f"SAM3 not installed. Install: pip install git+https://github.com/facebookresearch/sam3.git\nError: {e}"
+                f"SAM3 not installed. Install transformers with SAM3 support.\nError: {e}"
             )
 
     def unload(self) -> None:
         """Unload model from memory."""
         self.clear_image()
 
-        if self._predictor is not None:
-            del self._predictor
-            self._predictor = None
+        if self._processor is not None:
+            del self._processor
+            self._processor = None
 
         if self._model is not None:
             del self._model
@@ -97,7 +101,7 @@ class SAM3Segmenter:
             pass
 
     def is_loaded(self) -> bool:
-        return self._is_loaded and self._predictor is not None
+        return self._is_loaded and self._processor is not None
 
     def set_image(self, image: np.ndarray) -> None:
         """
@@ -114,10 +118,12 @@ class SAM3Segmenter:
         if image.dtype != np.uint8:
             image = (image * 255).astype(np.uint8)
         self._current_image = Image.fromarray(image)
+        self._current_image_size = (image.shape[0], image.shape[1])  # (H, W)
 
     def clear_image(self) -> None:
         """Clear the current image."""
         self._current_image = None
+        self._current_image_size = None
 
     def segment_detection(
         self,
@@ -125,10 +131,10 @@ class SAM3Segmenter:
         image: np.ndarray | None = None,
     ) -> SegmentationResult:
         """
-        Segment a single detection.
+        Segment a single detection using text prompt.
 
         Args:
-            detection: Detection to segment
+            detection: Detection to segment (uses class_name as text prompt)
             image: Optional image (uses cached if not provided)
 
         Returns:
@@ -158,6 +164,7 @@ class SAM3Segmenter:
 
             # Use defect type as text prompt for SAM3
             text_prompt = detection.class_name if hasattr(detection, 'class_name') else "anomaly"
+            logger.debug(f"SAM3 segmenting with text prompt: '{text_prompt}'")
 
             # Prepare inputs for SAM3
             inputs = self._processor(
@@ -170,28 +177,65 @@ class SAM3Segmenter:
             with torch.no_grad():
                 outputs = self._model(**inputs)
 
+            # Get original sizes from inputs for post-processing
+            original_sizes = inputs.get("original_sizes")
+            if original_sizes is not None:
+                target_sizes = original_sizes.tolist()
+            else:
+                # Fallback to stored image size
+                target_sizes = [list(self._current_image_size)] if self._current_image_size else None
+
             # Post-process results
             results = self._processor.post_process_instance_segmentation(
                 outputs,
-                threshold=self.config.mask_threshold,
+                threshold=self.config.score_threshold,
                 mask_threshold=self.config.mask_threshold,
-                target_sizes=inputs.get("original_sizes").tolist()
+                target_sizes=target_sizes
             )[0]
 
             if len(results['masks']) == 0:
+                logger.debug(f"SAM3: No mask generated for prompt '{text_prompt}'")
                 return SegmentationResult(
                     detection_id=detection.detection_id,
                     mask=None,
                     success=False,
-                    error_message="No mask generated",
+                    error_message=f"No mask generated for '{text_prompt}'",
                 )
 
             # Get the first/best mask
-            mask_data = results['masks'][0].cpu().numpy()
-            sam_score = float(results['scores'][0].cpu().numpy()) if len(results['scores']) > 0 else 1.0
+            mask_tensor = results['masks'][0]
+            if hasattr(mask_tensor, 'cpu'):
+                mask_data = mask_tensor.cpu().numpy()
+            else:
+                mask_data = np.array(mask_tensor)
 
-            # Convert to binary
-            mask_binary = (mask_data > self.config.mask_threshold).astype(np.uint8)
+            # Get score
+            if len(results.get('scores', [])) > 0:
+                score_tensor = results['scores'][0]
+                if hasattr(score_tensor, 'cpu'):
+                    sam_score = float(score_tensor.cpu().numpy())
+                else:
+                    sam_score = float(score_tensor)
+            else:
+                sam_score = 1.0
+
+            # Ensure mask is 2D binary
+            if mask_data.ndim > 2:
+                mask_data = mask_data.squeeze()
+            mask_binary = (mask_data > 0).astype(np.uint8)
+
+            # Check if mask has any content
+            mask_area = mask_binary.sum()
+            if mask_area == 0:
+                logger.debug(f"SAM3: Empty mask for prompt '{text_prompt}'")
+                return SegmentationResult(
+                    detection_id=detection.detection_id,
+                    mask=None,
+                    success=False,
+                    error_message=f"Empty mask for '{text_prompt}'",
+                )
+
+            logger.debug(f"SAM3: Found mask for '{text_prompt}', score={sam_score:.3f}, area={mask_area}")
 
             return SegmentationResult(
                 detection_id=detection.detection_id,
@@ -203,6 +247,7 @@ class SAM3Segmenter:
             )
 
         except Exception as e:
+            logger.error(f"SAM3 segmentation error: {e}")
             return SegmentationResult(
                 detection_id=detection.detection_id,
                 mask=None,
@@ -239,26 +284,26 @@ class SAM3Segmenter:
         finally:
             self.clear_image()
 
-    def segment_with_points(
+    def segment_with_box(
         self,
         image: np.ndarray,
-        points: list[tuple[int, int]],
-        labels: list[int] | None = None,
+        box_xyxy: list[int],
+        detection_id: str = "box_segment",
     ) -> SegmentationResult:
         """
-        Segment using point prompts.
+        Segment using a bounding box prompt.
 
         Args:
             image: RGB image
-            points: List of (x, y) points
-            labels: List of labels (1=foreground, 0=background)
+            box_xyxy: Bounding box as [x1, y1, x2, y2]
+            detection_id: Optional ID for the result
 
         Returns:
             SegmentationResult
         """
         if not self.is_loaded():
             return SegmentationResult(
-                detection_id="point_segment",
+                detection_id=detection_id,
                 mask=None,
                 success=False,
                 error_message="Model not loaded",
@@ -268,13 +313,12 @@ class SAM3Segmenter:
             self.set_image(image)
             import torch
 
-            # SAM3 uses text prompts, use generic "object" for point-based segmentation
-            text_prompt = "object"
-
-            # Prepare inputs
+            # Prepare inputs with box prompt
             inputs = self._processor(
                 images=self._current_image,
-                text=text_prompt,
+                text=None,
+                input_boxes=[[box_xyxy]],
+                input_boxes_labels=[[1]],  # Positive box
                 return_tensors="pt"
             ).to(self._device)
 
@@ -282,30 +326,53 @@ class SAM3Segmenter:
             with torch.no_grad():
                 outputs = self._model(**inputs)
 
+            # Get original sizes
+            original_sizes = inputs.get("original_sizes")
+            if original_sizes is not None:
+                target_sizes = original_sizes.tolist()
+            else:
+                target_sizes = [list(self._current_image_size)] if self._current_image_size else None
+
             # Post-process results
             results = self._processor.post_process_instance_segmentation(
                 outputs,
-                threshold=self.config.mask_threshold,
+                threshold=self.config.score_threshold,
                 mask_threshold=self.config.mask_threshold,
-                target_sizes=inputs.get("original_sizes").tolist()
+                target_sizes=target_sizes
             )[0]
 
             if len(results['masks']) == 0:
                 return SegmentationResult(
-                    detection_id="point_segment",
+                    detection_id=detection_id,
                     mask=None,
                     success=False,
-                    error_message="No mask generated",
+                    error_message="No mask generated from box",
                 )
 
             # Get the first mask
-            mask_data = results['masks'][0].cpu().numpy()
-            sam_score = float(results['scores'][0].cpu().numpy()) if len(results['scores']) > 0 else 1.0
+            mask_tensor = results['masks'][0]
+            if hasattr(mask_tensor, 'cpu'):
+                mask_data = mask_tensor.cpu().numpy()
+            else:
+                mask_data = np.array(mask_tensor)
 
-            mask_binary = (mask_data > self.config.mask_threshold).astype(np.uint8)
+            # Get score
+            if len(results.get('scores', [])) > 0:
+                score_tensor = results['scores'][0]
+                if hasattr(score_tensor, 'cpu'):
+                    sam_score = float(score_tensor.cpu().numpy())
+                else:
+                    sam_score = float(score_tensor)
+            else:
+                sam_score = 1.0
+
+            # Ensure mask is 2D binary
+            if mask_data.ndim > 2:
+                mask_data = mask_data.squeeze()
+            mask_binary = (mask_data > 0).astype(np.uint8)
 
             return SegmentationResult(
-                detection_id="point_segment",
+                detection_id=detection_id,
                 mask=SegmentationMask(
                     data=mask_binary,
                     sam_score=sam_score,
@@ -314,8 +381,9 @@ class SAM3Segmenter:
             )
 
         except Exception as e:
+            logger.error(f"SAM3 box segmentation error: {e}")
             return SegmentationResult(
-                detection_id="point_segment",
+                detection_id=detection_id,
                 mask=None,
                 success=False,
                 error_message=str(e),
