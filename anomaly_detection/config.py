@@ -1,4 +1,7 @@
-"""Configuration management for anomaly detection."""
+"""Configuration management for anomaly detection.
+
+Pipeline: VLM (OpenRouter) -> SAM3 Segmentation
+"""
 
 import os
 from dataclasses import dataclass, field
@@ -6,12 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 
-# Default class mappings
-DEFAULT_STRUCTURE_CLASSES = {
-    "beam", "column", "wall", "slab", "pipe",
-    "foundation", "joint", "girder", "truss", "deck",
-}
-
+# Default anomaly classes that VLM can detect
 DEFAULT_ANOMALY_CLASSES = {
     "crack", "corrosion", "spalling", "deformation", "stain",
     "efflorescence", "exposed_rebar", "delamination", "scaling",
@@ -48,10 +46,12 @@ def _get_float_env(key: str, default: float) -> float:
 
 @dataclass
 class EnvironmentConfig:
-    """Configuration loaded from environment variables."""
-    # Model paths
-    detector_model_path: Path | None = None
-    segmenter_model_path: Path | None = None
+    """Configuration loaded from environment variables.
+
+    Pipeline: VLM (OpenRouter) -> SAM3 Segmentation
+    """
+    # SAM3 model path (required)
+    sam3_model_path: Path | None = None
 
     # Device
     device: str = "auto"
@@ -62,12 +62,9 @@ class EnvironmentConfig:
     # Output
     mask_output_dir: Path | None = None
 
-    # VLM settings
-    enable_vlm_judge: bool = False
-    vlm_provider: str = "local"
-    qwen_model_path: str | None = None
+    # OpenRouter VLM settings (always enabled, primary detection method)
     openrouter_api_key: str | None = None
-    openrouter_model: str = "qwen/qwen-2.5-vl-72b-instruct"
+    openrouter_model: str = "bytedance-seed/seed-1.6-flash"
     vlm_every_n_frames: int = 10
     vlm_max_generation_frames: int = 60
 
@@ -78,7 +75,6 @@ class EnvironmentConfig:
     # Video processing
     target_fps: float = 30.0
     frame_buffer_size: int = 120
-    enable_tiling: bool = True
 
     @classmethod
     def from_env(cls) -> "EnvironmentConfig":
@@ -90,15 +86,12 @@ class EnvironmentConfig:
         except ImportError:
             pass
 
-        detector_path = os.environ.get("ANOMALY_DETECTOR_MODEL")
-        segmenter_path = os.environ.get("ANOMALY_SEGMENTER_MODEL")
+        sam3_path = os.environ.get("SAM3_MODEL_PATH")
         mask_dir = os.environ.get("ANOMALY_MASK_OUTPUT_DIR")
-        qwen_path = os.environ.get("QWEN_MODEL_PATH")
 
         return cls(
-            # Model paths
-            detector_model_path=Path(detector_path) if detector_path else None,
-            segmenter_model_path=Path(segmenter_path) if segmenter_path else None,
+            # SAM3 model path
+            sam3_model_path=Path(sam3_path) if sam3_path else None,
 
             # Device
             device=os.environ.get("ANOMALY_DEVICE", "auto"),
@@ -109,12 +102,9 @@ class EnvironmentConfig:
             # Output
             mask_output_dir=Path(mask_dir) if mask_dir else None,
 
-            # VLM
-            enable_vlm_judge=_get_bool_env("ENABLE_VLM_JUDGE", False),
-            vlm_provider=os.environ.get("VLM_PROVIDER", "local"),
-            qwen_model_path=qwen_path,
+            # OpenRouter VLM (primary detection)
             openrouter_api_key=os.environ.get("OPENROUTER_API_KEY"),
-            openrouter_model=os.environ.get("OPENROUTER_MODEL", "qwen/qwen-2.5-vl-72b-instruct"),
+            openrouter_model=os.environ.get("OPENROUTER_MODEL", "bytedance-seed/seed-1.6-flash"),
             vlm_every_n_frames=_get_int_env("VLM_EVERY_N_FRAMES", 10),
             vlm_max_generation_frames=_get_int_env("VLM_MAX_GENERATION_FRAMES", 60),
 
@@ -125,45 +115,39 @@ class EnvironmentConfig:
             # Video processing
             target_fps=_get_float_env("TARGET_FPS", 30.0),
             frame_buffer_size=_get_int_env("FRAME_BUFFER_SIZE", 120),
-            enable_tiling=_get_bool_env("ENABLE_TILING", True),
         )
 
     def validate(self) -> list[str]:
         """Validate configuration and return list of errors."""
         errors = []
 
-        if self.detector_model_path and not self.detector_model_path.exists():
-            errors.append(f"Detector model not found: {self.detector_model_path}")
+        if not self.sam3_model_path:
+            errors.append("SAM3_MODEL_PATH is required")
+        elif not self.sam3_model_path.exists():
+            errors.append(f"SAM3 model not found: {self.sam3_model_path}")
 
-        if self.segmenter_model_path and not self.segmenter_model_path.exists():
-            errors.append(f"Segmenter model not found: {self.segmenter_model_path}")
+        if not self.openrouter_api_key:
+            errors.append("OPENROUTER_API_KEY is required")
 
         if not 0.0 <= self.confidence_threshold <= 1.0:
             errors.append(f"Invalid confidence threshold: {self.confidence_threshold}")
-
-        if self.enable_vlm_judge and self.vlm_provider == "openrouter":
-            if not self.openrouter_api_key:
-                errors.append("OpenRouter API key required when using openrouter provider")
 
         return errors
 
     def print_config(self) -> None:
         """Print current configuration."""
         print("\n" + "=" * 60)
-        print("Anomaly Detection Configuration")
+        print("Anomaly Detection Pipeline (VLM + SAM3)")
         print("=" * 60)
-        print(f"  Segmenter Model:  {self.segmenter_model_path or 'Not set'}")
-        print(f"  Detector Model:   {self.detector_model_path or 'Pretrained'}")
+        print(f"  SAM3 Model:       {self.sam3_model_path or 'Not set'}")
         print(f"  Device:           {self.device}")
         print(f"  Confidence:       {self.confidence_threshold}")
-        print(f"  Enable Tiling:    {self.enable_tiling}")
         print()
-        print("VLM Configuration:")
-        print(f"  Enabled:          {self.enable_vlm_judge}")
-        if self.enable_vlm_judge:
-            print(f"  Provider:         {self.vlm_provider}")
-            print(f"  Every N Frames:   {self.vlm_every_n_frames}")
-            print(f"  Max Wait Frames:  {self.vlm_max_generation_frames}")
+        print("VLM Configuration (OpenRouter):")
+        print(f"  Model:            {self.openrouter_model}")
+        print(f"  API Key:          {'***' + self.openrouter_api_key[-4:] if self.openrouter_api_key else 'Not set'}")
+        print(f"  Every N Frames:   {self.vlm_every_n_frames}")
+        print(f"  Max Wait Frames:  {self.vlm_max_generation_frames}")
         print()
         print("Web Server:")
         print(f"  Host:             {self.web_host}")

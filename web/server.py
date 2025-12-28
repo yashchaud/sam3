@@ -1,9 +1,14 @@
-"""FastAPI server for anomaly detection web interface."""
+"""FastAPI server for anomaly detection web interface.
+
+Pipeline: VLM (OpenRouter) -> SAM3 Segmentation
+Configuration is loaded from environment variables.
+"""
 
 import asyncio
 import base64
 import io
 import json
+import logging
 import time
 import uuid
 from pathlib import Path
@@ -19,12 +24,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # Import our modules
+from anomaly_detection.config import get_config, EnvironmentConfig
 from anomaly_detection.realtime import RealtimeVideoProcessor, RealtimeConfig, FrameSource
 from anomaly_detection.vlm import VLMConfig, VLMProvider, GridConfig
 from anomaly_detection.utils import load_image, draw_detections, draw_mask_overlay
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Anomaly Detection", version="0.2.0")
+app = FastAPI(title="Anomaly Detection", version="0.3.0")
 
 # CORS for development
 app.add_middleware(
@@ -42,15 +51,6 @@ active_connections: list[WebSocket] = []
 
 
 # ============== Models ==============
-
-class ConfigRequest(BaseModel):
-    sam_model_path: str
-    vlm_provider: str = "openrouter"
-    openrouter_api_key: Optional[str] = None
-    vlm_every_n_frames: int = 10
-    confidence_threshold: float = 0.3
-    device: str = "auto"
-
 
 class ProcessingStatus(BaseModel):
     is_running: bool
@@ -102,55 +102,74 @@ async def root():
     return HTMLResponse(content="<h1>Static files not found. Run from correct directory.</h1>")
 
 
-@app.post("/api/config")
-async def set_config(config: ConfigRequest):
-    """Set pipeline configuration."""
-    global state
-
-    try:
-        # Build VLM config
-        vlm_config = VLMConfig(
-            provider=VLMProvider.OPENROUTER if config.vlm_provider == "openrouter" else VLMProvider.LOCAL_QWEN,
-            openrouter_api_key=config.openrouter_api_key,
-            process_every_n_frames=config.vlm_every_n_frames,
-            max_generation_frames=60,
-            grid_config=GridConfig(cols=3, rows=3),
-        )
-
-        # Build main config
-        state.config = RealtimeConfig(
-            segmenter_model_path=Path(config.sam_model_path),
-            detector_weights=Path(config.detector_weights) if config.detector_weights else None,
-            enable_vlm_judge=config.enable_vlm,
-            vlm_config=vlm_config,
-            confidence_threshold=config.confidence_threshold,
-            device=config.device,
-        )
-
-        return {"status": "ok", "message": "Configuration set"}
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.get("/api/config")
+async def get_current_config():
+    """Get current configuration from environment."""
+    env_config = get_config()
+    return {
+        "sam3_model_path": str(env_config.sam3_model_path) if env_config.sam3_model_path else None,
+        "openrouter_model": env_config.openrouter_model,
+        "openrouter_api_key_set": bool(env_config.openrouter_api_key),
+        "vlm_every_n_frames": env_config.vlm_every_n_frames,
+        "confidence_threshold": env_config.confidence_threshold,
+        "device": env_config.device,
+    }
 
 
 @app.post("/api/load")
 async def load_models():
-    """Load all models into memory."""
+    """Load all models into memory using environment configuration."""
     global state
 
-    if state.config is None:
-        raise HTTPException(status_code=400, detail="Configuration not set")
-
     try:
+        # Get configuration from environment
+        env_config = get_config()
+
+        # Validate configuration
+        errors = env_config.validate()
+        if errors:
+            raise HTTPException(status_code=400, detail="; ".join(errors))
+
+        # Build VLM config from environment
+        vlm_config = VLMConfig(
+            provider=VLMProvider.OPENROUTER,
+            openrouter_api_key=env_config.openrouter_api_key,
+            openrouter_model=env_config.openrouter_model,
+            process_every_n_frames=env_config.vlm_every_n_frames,
+            max_generation_frames=env_config.vlm_max_generation_frames,
+            grid_config=GridConfig(cols=3, rows=3),
+        )
+
+        # Build main config (VLM + SAM3 pipeline)
+        state.config = RealtimeConfig(
+            segmenter_model_path=env_config.sam3_model_path,
+            vlm_config=vlm_config,
+            confidence_threshold=env_config.confidence_threshold,
+            device=env_config.device,
+        )
+
         if state.processor is not None:
             state.processor.unload()
 
         state.processor = RealtimeVideoProcessor(state.config)
         state.processor.load()
 
-        return {"status": "ok", "message": "Models loaded"}
+        logger.info(f"Models loaded - SAM3: {env_config.sam3_model_path}, VLM: {env_config.openrouter_model}")
 
+        return {
+            "status": "ok",
+            "message": "Models loaded",
+            "config": {
+                "sam3_model": str(env_config.sam3_model_path),
+                "vlm_model": env_config.openrouter_model,
+                "device": env_config.device,
+            }
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Failed to load models: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

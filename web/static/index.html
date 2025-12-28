@@ -115,6 +115,38 @@
             margin-bottom: 16px;
         }
 
+        .config-display {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 12px;
+        }
+
+        .config-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .config-item:last-child {
+            border-bottom: none;
+        }
+
+        .config-label {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+
+        .config-value {
+            color: var(--text-primary);
+            font-size: 0.85rem;
+            font-family: monospace;
+            max-width: 150px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
         label {
             display: block;
             font-size: 0.875rem;
@@ -419,60 +451,41 @@
 
         <div class="main-grid">
             <aside class="sidebar">
-                <!-- Configuration -->
+                <!-- Configuration (from .env) -->
                 <div class="card">
                     <h3 class="card-title">Configuration</h3>
+                    <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 1rem;">
+                        Loaded from environment variables (.env file)
+                    </p>
 
-                    <div class="form-group">
-                        <label>SAM Model Path</label>
-                        <input type="text" id="samModelPath" placeholder="weights/sam2_hiera_large.pt">
-                    </div>
-
-                    <div class="form-group">
-                        <label>Detector Weights (optional)</label>
-                        <input type="text" id="detectorWeights" placeholder="Leave empty for pretrained">
-                    </div>
-
-                    <div class="form-group">
-                        <label>Confidence Threshold</label>
-                        <input type="number" id="confidenceThreshold" value="0.3" min="0" max="1" step="0.05">
-                    </div>
-
-                    <div class="form-group">
-                        <label>Device</label>
-                        <select id="device">
-                            <option value="auto">Auto</option>
-                            <option value="cuda">CUDA</option>
-                            <option value="cpu">CPU</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group checkbox-group">
-                        <input type="checkbox" id="enableVlm">
-                        <label for="enableVlm" style="margin: 0;">Enable VLM Judge</label>
-                    </div>
-
-                    <div id="vlmSettings" class="hidden">
-                        <div class="form-group">
-                            <label>VLM Provider</label>
-                            <select id="vlmProvider">
-                                <option value="local">Local (Qwen)</option>
-                                <option value="openrouter">OpenRouter</option>
-                            </select>
+                    <div class="config-display">
+                        <div class="config-item">
+                            <span class="config-label">SAM3 Model:</span>
+                            <span class="config-value" id="configSam3">-</span>
                         </div>
-
-                        <div class="form-group" id="openrouterKeyGroup">
-                            <label>OpenRouter API Key</label>
-                            <input type="text" id="openrouterKey" placeholder="sk-or-...">
+                        <div class="config-item">
+                            <span class="config-label">VLM Model:</span>
+                            <span class="config-value" id="configVlmModel">-</span>
                         </div>
-
-                        <div class="form-group">
-                            <label>Process Every N Frames</label>
-                            <input type="number" id="vlmEveryN" value="10" min="1" max="60">
+                        <div class="config-item">
+                            <span class="config-label">API Key:</span>
+                            <span class="config-value" id="configApiKey">-</span>
+                        </div>
+                        <div class="config-item">
+                            <span class="config-label">Device:</span>
+                            <span class="config-value" id="configDevice">-</span>
+                        </div>
+                        <div class="config-item">
+                            <span class="config-label">Confidence:</span>
+                            <span class="config-value" id="configConfidence">-</span>
+                        </div>
+                        <div class="config-item">
+                            <span class="config-label">VLM Every N:</span>
+                            <span class="config-value" id="configVlmEveryN">-</span>
                         </div>
                     </div>
 
-                    <div class="button-group">
+                    <div class="button-group" style="margin-top: 1rem;">
                         <button id="loadBtn">Load Models</button>
                         <button id="unloadBtn" class="secondary">Unload</button>
                     </div>
@@ -699,14 +712,24 @@
             }
         }
 
-        // VLM settings toggle
-        document.getElementById('enableVlm').addEventListener('change', (e) => {
-            document.getElementById('vlmSettings').classList.toggle('hidden', !e.target.checked);
-        });
-
-        document.getElementById('vlmProvider').addEventListener('change', (e) => {
-            document.getElementById('openrouterKeyGroup').classList.toggle('hidden', e.target.value !== 'openrouter');
-        });
+        // Load configuration from server on page load
+        async function loadConfig() {
+            try {
+                const response = await fetch('/api/config');
+                if (response.ok) {
+                    const config = await response.json();
+                    document.getElementById('configSam3').textContent = config.sam3_model_path || 'Not set';
+                    document.getElementById('configVlmModel').textContent = config.openrouter_model || '-';
+                    document.getElementById('configApiKey').textContent = config.openrouter_api_key_set ? 'Set' : 'Not set';
+                    document.getElementById('configDevice').textContent = config.device || 'auto';
+                    document.getElementById('configConfidence').textContent = config.confidence_threshold || '0.3';
+                    document.getElementById('configVlmEveryN').textContent = config.vlm_every_n_frames || '10';
+                }
+            } catch (e) {
+                console.error('Failed to load config:', e);
+            }
+        }
+        loadConfig();
 
         // Tabs
         document.querySelectorAll('.tab').forEach(tab => {
@@ -900,44 +923,24 @@
             `).join('');
         }
 
-        // Load/Unload models
+        // Load/Unload models (uses environment configuration)
         document.getElementById('loadBtn').addEventListener('click', async () => {
-            const config = {
-                sam_model_path: document.getElementById('samModelPath').value,
-                detector_weights: document.getElementById('detectorWeights').value || null,
-                enable_vlm: document.getElementById('enableVlm').checked,
-                vlm_provider: document.getElementById('vlmProvider').value,
-                openrouter_api_key: document.getElementById('openrouterKey').value || null,
-                vlm_every_n_frames: parseInt(document.getElementById('vlmEveryN').value),
-                confidence_threshold: parseFloat(document.getElementById('confidenceThreshold').value),
-                device: document.getElementById('device').value,
-            };
-
             try {
-                // Set config
-                let response = await fetch('/api/config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(config),
-                });
-
-                if (!response.ok) {
-                    const data = await response.json();
-                    throw new Error(data.detail);
-                }
-
-                // Load models
                 statusText.textContent = 'Loading models...';
-                response = await fetch('/api/load', { method: 'POST' });
+                const response = await fetch('/api/load', { method: 'POST' });
 
                 if (!response.ok) {
                     const data = await response.json();
                     throw new Error(data.detail);
                 }
 
+                const result = await response.json();
                 isModelsLoaded = true;
-                showToast('Models loaded successfully', 'success');
+                showToast(`Models loaded: ${result.config.vlm_model}`, 'success');
                 statusText.textContent = 'Ready';
+
+                // Refresh config display
+                loadConfig();
 
             } catch (error) {
                 showToast('Failed to load: ' + error.message, 'error');
