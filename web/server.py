@@ -497,21 +497,23 @@ async def process_video_task(video_path: str):
         # Process video using processor.process_video() with video tracker
         from ..realtime import FrameSource
 
-        frame_idx = 0
+        # Open video capture for reading frames to annotate
+        cap = cv2.VideoCapture(video_path)
 
         # Process video with video tracker - this yields FrameResult for each frame
         async for result in state.processor.process_video(source_path=video_path, source_type=FrameSource.FILE):
+            if not state.is_processing:
+                break
+
             state.frames_processed = result.frame_index + 1
             state.total_detections += len(result.all_anomalies)
 
-            # We need to get the frame image for annotation
-            # The video tracker processes frames internally, we need to read them separately for display
-            cap_temp = cv2.VideoCapture(video_path)
-            cap_temp.set(cv2.CAP_PROP_POS_FRAMES, result.frame_index)
-            ret, frame = cap_temp.read()
-            cap_temp.release()
+            # Read corresponding frame for annotation
+            cap.set(cv2.CAP_PROP_POS_FRAMES, result.frame_index)
+            ret, frame = cap.read()
 
             if not ret:
+                logger.warning(f"Failed to read frame {result.frame_index} for annotation")
                 continue
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -545,7 +547,7 @@ async def process_video_task(video_path: str):
             _, buffer = cv2.imencode('.jpg', annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
             img_base64 = base64.b64encode(buffer).decode('utf-8')
 
-            # Broadcast to clients
+            # Broadcast to clients IMMEDIATELY
             await broadcast_message({
                 "type": "frame",
                 "frame_index": result.frame_index,
@@ -556,8 +558,12 @@ async def process_video_task(video_path: str):
                 "progress": (result.frame_index + 1) / total_frames if total_frames > 0 else 0,
             })
 
+            logger.info(f"Sent frame {result.frame_index}/{total_frames} with {len(result.all_anomalies)} anomalies")
+
             # Small delay to prevent overwhelming clients
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.001)
+
+        cap.release()
 
         # Get final stats
         stats = state.processor.get_stats()
