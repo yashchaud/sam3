@@ -50,6 +50,16 @@ class DetectionRequest(BaseModel):
     )
 
 
+class URLDetectionRequest(BaseModel):
+    """Request model for URL detection endpoint."""
+    image_url: str = Field(..., description="URL of image to process")
+    frame_id: Optional[str] = Field(None, description="Optional frame identifier")
+    include_masks: bool = Field(False, description="Include masks in response")
+    confidence_threshold: Optional[float] = Field(
+        None, description="Override confidence threshold"
+    )
+
+
 class BatchDetectionRequest(BaseModel):
     """Request model for batch detection endpoint."""
     images: List[str] = Field(..., description="List of base64 encoded images")
@@ -358,6 +368,49 @@ async def detect_upload(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/detect/url")
+async def detect_url(request: URLDetectionRequest):
+    """
+    Run anomaly detection on image from URL.
+    """
+    if not pipeline or not pipeline.is_loaded():
+        raise HTTPException(status_code=503, detail="Pipeline not loaded")
+
+    try:
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(request.image_url)
+            response.raise_for_status()
+
+        image = Image.open(BytesIO(response.content)).convert("RGB")
+        image_array = np.array(image)
+
+        # Override confidence if provided
+        original_conf = None
+        if request.confidence_threshold is not None:
+            original_conf = pipeline.config.detector_config.confidence_threshold
+            pipeline.config.detector_config.confidence_threshold = request.confidence_threshold
+
+        result = pipeline.process(image_array, frame_id=request.frame_id)
+
+        # Restore confidence
+        if original_conf is not None:
+            pipeline.config.detector_config.confidence_threshold = original_conf
+
+        return process_result(result, request.include_masks)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Aliases for /process/* routes (for compatibility)
+app.post("/process")(detect)
+app.post("/process/upload")(detect_upload)
+app.post("/process/url")(detect_url)
+app.post("/batch/process")(detect_batch)
 
 
 def main():
